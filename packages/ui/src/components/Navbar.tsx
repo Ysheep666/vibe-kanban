@@ -133,6 +133,7 @@ function NavbarBreadcrumbs({
             {crumb.onClick && !isLast ? (
               <button
                 type="button"
+                title={crumb.label}
                 className="text-low hover:text-normal truncate cursor-pointer"
                 onClick={crumb.onClick}
               >
@@ -140,6 +141,7 @@ function NavbarBreadcrumbs({
               </button>
             ) : (
               <span
+                title={crumb.label}
                 className={cn('truncate', isLast ? 'text-normal' : 'text-low')}
               >
                 {crumb.label}
@@ -449,7 +451,8 @@ export function Navbar({
         ) : (
           <p
             data-tauri-drag-region
-            className="text-base text-low truncate cursor-default select-none"
+            title={workspaceTitle}
+            className="text-base text-low truncate cursor-default select-none max-w-full"
           >
             {workspaceTitle ?? ''}
           </p>

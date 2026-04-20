@@ -321,11 +321,13 @@ export function SharedAppLayout() {
                 <CloudShutdownExportBanner onClick={handleExportClick} />
               </div>
             )}
-            {/* Desktop corner spacer. */}
+            {/* Desktop corner spacer. Reserves room for macOS traffic lights
+                (positioned at x=8, 3×12px buttons + 2×8px gaps ≈ 60px) so the
+                Navbar's left items never collide with them. */}
             <div
               data-tauri-drag-region
               className="bg-secondary"
-              style={isTauriMac() ? { minWidth: 56 } : undefined}
+              style={isTauriMac() ? { minWidth: 80 } : undefined}
             />
             {/* Desktop navbar. */}
             <NavbarContainer
