@@ -1044,114 +1044,63 @@ pub trait ContainerService {
         }
     }
 
+    /// Thin wrapper around `start_workspace_with_context` that discards the
+    /// failure-context tuple element. Use `start_workspace_with_context`
+    /// directly when you need the stderr tail / program name on failure.
     async fn start_workspace(
         &self,
         workspace: &Workspace,
         executor_config: ExecutorConfig,
         prompt: String,
     ) -> Result<ExecutionProcess, ContainerError> {
-        // Create container
-        self.create(workspace).await?;
-
-        let repos = WorkspaceRepo::find_repos_for_workspace(&self.db().pool, workspace.id).await?;
-
-        let workspace = Workspace::find_by_id(&self.db().pool, workspace.id)
-            .await?
-            .ok_or(SqlxError::RowNotFound)?;
-
-        // Create a session for this workspace
-        let session = Session::create(
-            &self.db().pool,
-            &CreateSession {
-                executor: Some(executor_config.executor.to_string()),
-                name: None,
-            },
-            Uuid::new_v4(),
-            workspace.id,
-        )
-        .await?;
-
-        let repos_with_setup: Vec<_> = repos.iter().filter(|r| r.setup_script.is_some()).collect();
-
-        let all_parallel = repos_with_setup.iter().all(|r| r.parallel_setup_script);
-
-        let cleanup_action = self.cleanup_actions_for_repos(&repos);
-
-        let working_dir = session
-            .agent_working_dir
-            .as_ref()
-            .filter(|dir| !dir.is_empty())
-            .cloned();
-
-        let coding_action = ExecutorAction::new(
-            ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
-                prompt,
-                executor_config: executor_config.clone(),
-                working_dir,
-            }),
-            cleanup_action.map(Box::new),
-        );
-
-        let execution_process = if all_parallel {
-            // All parallel: start each setup independently, then start coding agent
-            for repo in &repos_with_setup {
-                if let Some(action) = Self::setup_action_for_repo(repo)
-                    && let Err(e) = self
-                        .start_execution(
-                            &workspace,
-                            &session,
-                            &action,
-                            &ExecutionProcessRunReason::SetupScript,
-                        )
-                        .await
-                {
-                    tracing::warn!(?e, "Failed to start setup script in parallel mode");
-                }
-            }
-            self.start_execution(
-                &workspace,
-                &session,
-                &coding_action,
-                &ExecutionProcessRunReason::CodingAgent,
-            )
-            .await?
-        } else {
-            // Any sequential: chain ALL setups → coding agent via next_action
-            let main_action = Self::build_sequential_setup_chain(&repos_with_setup, coding_action);
-            self.start_execution(
-                &workspace,
-                &session,
-                &main_action,
-                &ExecutionProcessRunReason::SetupScript,
-            )
-            .await?
-        };
-
-        Ok(execution_process)
+        self.start_workspace_with_context(workspace, executor_config, prompt)
+            .await
+            .0
     }
 
-    async fn start_execution(
+    /// Core implementation shared by `start_execution` and `start_execution_with_context`.
+    ///
+    /// On `start_execution_inner` failure the MsgStore is read for stderr **before**
+    /// being removed, so callers that care about the tail can observe it.  The
+    /// returned `ExecutorFailureContext` is `Some` on error and `None` on success.
+    ///
+    /// `start_execution` ignores the context tuple element; `start_execution_with_context`
+    /// returns it to its own caller.
+    async fn start_execution_core(
         &self,
         workspace: &Workspace,
         session: &Session,
         executor_action: &ExecutorAction,
         run_reason: &ExecutionProcessRunReason,
-    ) -> Result<ExecutionProcess, ContainerError> {
+    ) -> (
+        Result<ExecutionProcess, ContainerError>,
+        Option<ExecutorFailureContext>,
+    ) {
         // Create new execution process record
         // Capture current HEAD per repository as the "before" commit for this execution
         let repositories =
-            WorkspaceRepo::find_repos_for_workspace(&self.db().pool, workspace.id).await?;
+            match WorkspaceRepo::find_repos_for_workspace(&self.db().pool, workspace.id).await {
+                Ok(r) => r,
+                Err(e) => return (Err(e.into()), None),
+            };
         if repositories.is_empty() {
-            return Err(ContainerError::Other(anyhow!(
-                "Workspace has no repositories configured"
-            )));
+            return (
+                Err(ContainerError::Other(anyhow!(
+                    "Workspace has no repositories configured"
+                ))),
+                None,
+            );
         }
 
-        let workspace_root = workspace
+        let workspace_root = match workspace
             .container_ref
             .as_ref()
             .map(std::path::PathBuf::from)
-            .ok_or_else(|| ContainerError::Other(anyhow!("Container ref not found")))?;
+            .ok_or_else(|| ContainerError::Other(anyhow!("Container ref not found")))
+        {
+            Ok(r) => r,
+            Err(e) => return (Err(e), None),
+        };
 
         let mut repo_states = Vec::with_capacity(repositories.len());
         for repo in &repositories {
@@ -1170,17 +1119,23 @@ pub trait ContainerService {
             run_reason: run_reason.clone(),
         };
 
-        let execution_process = ExecutionProcess::create(
+        let execution_process = match ExecutionProcess::create(
             &self.db().pool,
             &create_execution_process,
             Uuid::new_v4(),
             &repo_states,
         )
-        .await?;
+        .await
+        {
+            Ok(ep) => ep,
+            Err(e) => return (Err(e.into()), None),
+        };
+
         self.msg_stores()
             .write()
             .await
             .insert(execution_process.id, Arc::new(MsgStore::new()));
+
         if *run_reason != ExecutionProcessRunReason::ArchiveScript
             && let Err(e) = Workspace::set_archived(&self.db().pool, workspace.id, false).await
         {
@@ -1188,7 +1143,7 @@ pub trait ContainerService {
                 .write()
                 .await
                 .remove(&execution_process.id);
-            return Err(e.into());
+            return (Err(e.into()), None);
         }
 
         if let Some(prompt) = match executor_action.typ() {
@@ -1229,7 +1184,7 @@ pub trait ContainerService {
                     .write()
                     .await
                     .remove(&execution_process.id);
-                return Err(e.into());
+                return (Err(e.into()), None);
             }
         }
 
@@ -1237,6 +1192,29 @@ pub trait ContainerService {
             .start_execution_inner(workspace, &execution_process, executor_action)
             .await
         {
+            // Capture stderr tail BEFORE removing the MsgStore so callers can
+            // surface it to the API response.
+            let stderr_tail = self
+                .get_msg_store_by_id(&execution_process.id)
+                .await
+                .and_then(|store| store.collect_stderr_tail(2048));
+
+            // Derive program name from the error when available.
+            let program =
+                if let ContainerError::ExecutorError(ExecutorError::ExecutableNotFound {
+                    program,
+                }) = &start_error
+                {
+                    Some(program.clone())
+                } else {
+                    None
+                };
+
+            let failure_ctx = ExecutorFailureContext {
+                stderr_tail,
+                program,
+            };
+
             self.msg_stores()
                 .write()
                 .await
@@ -1300,7 +1278,7 @@ pub trait ContainerService {
                     );
                 }
             };
-            return Err(start_error);
+            return (Err(start_error), Some(failure_ctx));
         }
 
         // Start processing normalised logs for executor requests and follow ups
@@ -1328,10 +1306,13 @@ pub trait ContainerService {
                         .write()
                         .await
                         .remove(&execution_process.id);
-                    return Err(ContainerError::Other(anyhow!(
-                        "MsgStore missing for execution {} during normalization setup",
-                        execution_process.id
-                    )));
+                    return (
+                        Err(ContainerError::Other(anyhow!(
+                            "MsgStore missing for execution {} during normalization setup",
+                            execution_process.id
+                        ))),
+                        None,
+                    );
                 }
             };
             #[cfg(feature = "qa-mode")]
@@ -1360,7 +1341,21 @@ pub trait ContainerService {
             execution_process.id,
             session.id,
         );
-        Ok(execution_process)
+        (Ok(execution_process), None)
+    }
+
+    /// Start a new execution process.  Identical public behavior to before Task 1.5;
+    /// internally delegates to `start_execution_core` and discards the failure context.
+    async fn start_execution(
+        &self,
+        workspace: &Workspace,
+        session: &Session,
+        executor_action: &ExecutorAction,
+        run_reason: &ExecutionProcessRunReason,
+    ) -> Result<ExecutionProcess, ContainerError> {
+        self.start_execution_core(workspace, session, executor_action, run_reason)
+            .await
+            .0
     }
 
     async fn try_start_next_action(&self, ctx: &ExecutionContext) -> Result<(), ContainerError> {
@@ -1397,4 +1392,145 @@ pub trait ContainerService {
         tracing::debug!("Started next action: {:?}", next_action);
         Ok(())
     }
+
+    /// Sister method to `start_execution` that also returns failure context on error.
+    ///
+    /// On success the second element is `None`.
+    /// On failure the second element contains the stderr tail captured from the
+    /// `MsgStore` before cleanup, plus the program name when it can be derived
+    /// from the `ExecutorError` variant.  Delegates to `start_execution_core`.
+    async fn start_execution_with_context(
+        &self,
+        workspace: &Workspace,
+        session: &Session,
+        executor_action: &ExecutorAction,
+        run_reason: &ExecutionProcessRunReason,
+    ) -> (
+        Result<ExecutionProcess, ContainerError>,
+        Option<ExecutorFailureContext>,
+    ) {
+        self.start_execution_core(workspace, session, executor_action, run_reason)
+            .await
+    }
+
+    /// Sister method to `start_workspace` that also returns failure context on error.
+    ///
+    /// On success the second element is `None`.  On failure the second element
+    /// contains whatever stderr was buffered before cleanup, plus the program name
+    /// when derivable from the error.
+    async fn start_workspace_with_context(
+        &self,
+        workspace: &Workspace,
+        executor_config: ExecutorConfig,
+        prompt: String,
+    ) -> (
+        Result<ExecutionProcess, ContainerError>,
+        Option<ExecutorFailureContext>,
+    ) {
+        // Create container
+        if let Err(e) = self.create(workspace).await {
+            return (Err(e), None);
+        }
+
+        let repos =
+            match WorkspaceRepo::find_repos_for_workspace(&self.db().pool, workspace.id).await {
+                Ok(r) => r,
+                Err(e) => return (Err(e.into()), None),
+            };
+
+        let workspace = match Workspace::find_by_id(&self.db().pool, workspace.id).await {
+            Ok(Some(w)) => w,
+            Ok(None) => {
+                return (
+                    Err(ContainerError::Other(anyhow!("Workspace not found"))),
+                    None,
+                );
+            }
+            Err(e) => return (Err(e.into()), None),
+        };
+
+        // Create a session for this workspace
+        let session = match Session::create(
+            &self.db().pool,
+            &CreateSession {
+                executor: Some(executor_config.executor.to_string()),
+                name: None,
+            },
+            Uuid::new_v4(),
+            workspace.id,
+        )
+        .await
+        {
+            Ok(s) => s,
+            Err(e) => return (Err(e.into()), None),
+        };
+
+        let repos_with_setup: Vec<_> = repos.iter().filter(|r| r.setup_script.is_some()).collect();
+        let all_parallel = repos_with_setup.iter().all(|r| r.parallel_setup_script);
+        let cleanup_action = self.cleanup_actions_for_repos(&repos);
+
+        let working_dir = session
+            .agent_working_dir
+            .as_ref()
+            .filter(|dir| !dir.is_empty())
+            .cloned();
+
+        let coding_action = ExecutorAction::new(
+            ExecutorActionType::CodingAgentInitialRequest(CodingAgentInitialRequest {
+                prompt,
+                executor_config: executor_config.clone(),
+                working_dir,
+            }),
+            cleanup_action.map(Box::new),
+        );
+
+        if all_parallel {
+            // All parallel: start each setup independently, then start the coding agent
+            // with context. Setup-script spawn failures here are intentionally swallowed
+            // into `tracing::warn!` logs — only the terminal coding-agent spawn below
+            // surfaces an `ExecutorFailureContext` to API callers.
+            for repo in &repos_with_setup {
+                if let Some(action) = Self::setup_action_for_repo(repo)
+                    && let Err(e) = self
+                        .start_execution(
+                            &workspace,
+                            &session,
+                            &action,
+                            &ExecutionProcessRunReason::SetupScript,
+                        )
+                        .await
+                {
+                    tracing::warn!(?e, "Failed to start setup script in parallel mode");
+                }
+            }
+            self.start_execution_core(
+                &workspace,
+                &session,
+                &coding_action,
+                &ExecutionProcessRunReason::CodingAgent,
+            )
+            .await
+        } else {
+            // Any sequential: chain ALL setups → coding agent via next_action.
+            let main_action = Self::build_sequential_setup_chain(&repos_with_setup, coding_action);
+            self.start_execution_core(
+                &workspace,
+                &session,
+                &main_action,
+                &ExecutionProcessRunReason::SetupScript,
+            )
+            .await
+        }
+    }
+}
+
+/// Context attached to an executor failure, surfaced to API callers.
+#[derive(Debug, Clone, Default)]
+pub struct ExecutorFailureContext {
+    /// Last ≤2048 bytes of the aborted process's stderr (UTF-8-safe left truncation).
+    /// `None` if no stderr was buffered before the MsgStore was cleaned up.
+    pub stderr_tail: Option<String>,
+    /// Program name derived from the executor error, when extractable
+    /// (currently only from `ExecutorError::ExecutableNotFound`).
+    pub program: Option<String>,
 }

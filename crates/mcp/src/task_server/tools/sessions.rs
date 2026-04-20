@@ -133,10 +133,20 @@ struct GetExecutionRequest {
 struct GetExecutionResponse {
     execution_id: String,
     session_id: String,
-    status: String,
+    /// Machine-readable execution status (wire format: lowercase string).
+    #[schemars(with = "String")]
+    status: db::models::execution_process::ExecutionProcessStatus,
     is_finished: bool,
     execution: serde_json::Value,
-    #[schemars(description = "Final assistant message/summary when execution has finished")]
+    /// Structured failure info populated by the server on error paths.
+    /// Currently always `None` for `get_execution` because failure metadata
+    /// is not persisted on `ExecutionProcess` yet — surfaces only on
+    /// in-flight spawn failures via `follow_up` / `create_and_start_workspace`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<serde_json::Value>")]
+    error: Option<utils::response::ApiErrorEnvelope>,
+    /// Deprecated — always `null`. Use `read_session_messages` (coming in PR-X2).
+    #[schemars(description = "DEPRECATED — always null. Use read_session_messages instead.")]
     final_message: Option<String>,
 }
 
@@ -348,9 +358,15 @@ impl McpServer {
         Self::success(&GetExecutionResponse {
             execution_id: execution_process.id.to_string(),
             session_id: execution_process.session_id.to_string(),
-            status: Self::execution_process_status_label(&execution_process.status).to_string(),
+            status: execution_process.status.clone(),
             is_finished,
             execution: execution_process_value,
+            // TODO: populate from persisted failure metadata once `ExecutionProcess`
+            // carries failure columns (e.g. `failure_kind`, `stderr_tail`). Today the
+            // in-flight spawn-failure path surfaces `ApiErrorEnvelope` via the
+            // `follow_up` / `create_and_start_workspace` HTTP error body (Task 1.5),
+            // but `get_execution` reads a stored row that has no envelope yet.
+            error: None,
             final_message: None,
         })
     }
@@ -392,5 +408,61 @@ impl McpServer {
                 Some(error.to_string()),
             )
         })
+    }
+}
+
+#[cfg(test)]
+mod get_execution_tests {
+    use db::models::execution_process::ExecutionProcessStatus;
+
+    use super::*;
+
+    #[test]
+    fn status_serializes_lowercase() {
+        let resp = GetExecutionResponse {
+            execution_id: "abc".into(),
+            session_id: "def".into(),
+            status: ExecutionProcessStatus::Failed,
+            is_finished: true,
+            execution: serde_json::json!({}),
+            error: Some(utils::response::ApiErrorEnvelope {
+                kind: "auth_required".into(),
+                retryable: false,
+                human_intervention_required: true,
+                stderr_tail: None,
+                program: None,
+            }),
+            final_message: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["status"], "failed");
+        assert_eq!(v["error"]["kind"], "auth_required");
+        assert_eq!(v["error"]["retryable"], false);
+        assert_eq!(v["error"]["human_intervention_required"], true);
+    }
+
+    #[test]
+    fn final_message_stays_none() {
+        // D11: final_message always None; manager must use read_session_messages.
+        let resp = GetExecutionResponse {
+            execution_id: "a".into(),
+            session_id: "b".into(),
+            status: ExecutionProcessStatus::Completed,
+            is_finished: true,
+            execution: serde_json::json!({}),
+            error: None,
+            final_message: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(
+            v["final_message"].is_null(),
+            "final_message should be null: {json}"
+        );
+        assert!(
+            v.get("error").is_none(),
+            "error should be omitted when None: {json}"
+        );
     }
 }

@@ -17,9 +17,9 @@ use uuid::Uuid;
 use crate::{
     DeploymentImpl,
     error::ApiError,
-    routes::cursor_mcp::adopt_cursor_mcp_lobby_session,
-    routes::workspaces::attachments::{
-        ImportedIssueAttachment, import_issue_attachments_from_remote,
+    routes::{
+        cursor_mcp::adopt_cursor_mcp_lobby_session,
+        workspaces::attachments::{ImportedIssueAttachment, import_issue_attachments_from_remote},
     },
 };
 
@@ -389,10 +389,12 @@ pub async fn create_and_start_workspace(
     let workspace = managed_workspace.workspace.clone();
     tracing::info!("Created workspace {}", workspace.id);
 
-    let execution_process = deployment
+    let (workspace_result, failure_ctx) = deployment
         .container()
-        .start_workspace(&workspace, executor_config.clone(), workspace_prompt)
-        .await?;
+        .start_workspace_with_context(&workspace, executor_config.clone(), workspace_prompt)
+        .await;
+    let execution_process = workspace_result
+        .map_err(|e| crate::error::map_container_err_with_context(e, failure_ctx))?;
 
     if let Some(adopt_context) = adopt_context {
         adopt_cursor_mcp_lobby_session(
@@ -460,12 +462,11 @@ mod tests {
     use executors::executors::BaseCodingAgent;
     use uuid::Uuid;
 
-    use crate::error::ApiError;
-
     use super::{
         CursorMcpAdoptionContext, ImportedIssueAttachment, resolve_cursor_mcp_adoption_context,
         rewrite_imported_issue_attachments_markdown,
     };
+    use crate::error::ApiError;
 
     fn imported_file(
         attachment_id: Uuid,

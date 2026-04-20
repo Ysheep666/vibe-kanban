@@ -67,6 +67,10 @@ impl MsgStore {
         self.push(LogMsg::Stdout(s.into()));
     }
 
+    pub fn push_stderr<S: Into<String>>(&self, s: S) {
+        self.push(LogMsg::Stderr(s.into()));
+    }
+
     pub fn push_patch(&self, patch: json_patch::Patch) {
         self.push(LogMsg::JsonPatch(patch));
     }
@@ -154,6 +158,35 @@ impl MsgStore {
             .boxed()
     }
 
+    /// Collect all buffered stderr chunks and return the last `limit_bytes` bytes.
+    ///
+    /// Concatenates all `LogMsg::Stderr` entries in history order, then truncates
+    /// from the left so the returned string is at most `limit_bytes` bytes.
+    /// Returns `None` if there are no stderr entries.
+    pub fn collect_stderr_tail(&self, limit_bytes: usize) -> Option<String> {
+        let inner = self.inner.read().unwrap();
+        let combined: String = inner
+            .history
+            .iter()
+            .filter_map(|s| {
+                if let LogMsg::Stderr(text) = &s.msg {
+                    Some(text.as_str())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if combined.is_empty() {
+            return None;
+        }
+
+        Some(crate::text::truncate_left_to_char_boundary(
+            &combined,
+            limit_bytes,
+        ))
+    }
+
     /// Forward a stream of typed log messages into this store.
     pub fn spawn_forwarder<S, E>(self: Arc<Self>, stream: S) -> JoinHandle<()>
     where
@@ -170,5 +203,46 @@ impl MsgStore {
                 }
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod collect_stderr_tail_tests {
+    use super::*;
+
+    #[test]
+    fn returns_none_when_history_is_empty() {
+        let store = MsgStore::new();
+        assert_eq!(store.collect_stderr_tail(2048), None);
+    }
+
+    #[test]
+    fn returns_none_when_only_stdout() {
+        let store = MsgStore::new();
+        store.push_stdout("normal output".to_string());
+        assert_eq!(store.collect_stderr_tail(2048), None);
+    }
+
+    #[test]
+    fn returns_full_text_when_below_limit() {
+        let store = MsgStore::new();
+        store.push_stderr("line one".to_string());
+        store.push_stderr("line two".to_string());
+        let out = store.collect_stderr_tail(2048).unwrap();
+        assert!(out.contains("line one"));
+        assert!(out.contains("line two"));
+        assert!(
+            !out.starts_with('…'),
+            "short content should not be truncated"
+        );
+    }
+
+    #[test]
+    fn truncates_when_above_limit_with_ellipsis() {
+        let store = MsgStore::new();
+        store.push_stderr("x".repeat(3000));
+        let out = store.collect_stderr_tail(2048).unwrap();
+        assert!(out.starts_with('…'));
+        assert!(out.len() <= 2048 + 6);
     }
 }

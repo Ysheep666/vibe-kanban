@@ -27,7 +27,7 @@ use services::services::{
 };
 use thiserror::Error;
 use trusted_key_auth::error::TrustedKeyAuthError;
-use utils::response::ApiResponse;
+use utils::response::{ApiErrorEnvelope, ApiResponse};
 use workspace_manager::WorkspaceError as WorkspaceManagerError;
 use worktree_manager::WorktreeError;
 
@@ -54,6 +54,17 @@ pub enum ApiError {
     Container(ContainerError),
     #[error(transparent)]
     Executor(#[from] ExecutorError),
+    /// Executor failure with captured context (stderr tail + program) to
+    /// surface through the MCP / HTTP error envelope.
+    ///
+    /// `message` is the `Display` string of the original `ExecutorError`.
+    /// (`ExecutorError` is not `Clone` because it wraps `std::io::Error`;
+    /// the envelope's `kind` field preserves the typed classification.)
+    #[error("{message}")]
+    ExecutorWithContext {
+        message: String,
+        envelope: ApiErrorEnvelope,
+    },
     #[error(transparent)]
     Database(#[from] sqlx::Error),
     #[error(transparent)]
@@ -175,6 +186,7 @@ struct ErrorInfo {
     status: StatusCode,
     error_type: &'static str,
     message: Option<String>,
+    envelope: Option<utils::response::ApiErrorEnvelope>,
 }
 
 impl ErrorInfo {
@@ -183,6 +195,7 @@ impl ErrorInfo {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             error_type,
             message: Some("An internal error occurred. Please try again.".into()),
+            envelope: None,
         }
     }
 
@@ -191,6 +204,7 @@ impl ErrorInfo {
             status: StatusCode::NOT_FOUND,
             error_type,
             message: Some(msg.into()),
+            envelope: None,
         }
     }
 
@@ -199,6 +213,7 @@ impl ErrorInfo {
             status: StatusCode::BAD_REQUEST,
             error_type,
             message: Some(msg.into()),
+            envelope: None,
         }
     }
 
@@ -207,6 +222,7 @@ impl ErrorInfo {
             status: StatusCode::CONFLICT,
             error_type,
             message: Some(msg.into()),
+            envelope: None,
         }
     }
 
@@ -215,7 +231,60 @@ impl ErrorInfo {
             status,
             error_type,
             message: Some(msg.into()),
+            envelope: None,
         }
+    }
+}
+
+/// Classify an `ExecutorError` into the stable 5-kind envelope surfaced to clients.
+/// - `executor_not_found`: missing binary
+/// - `auth_required`: user must re-authenticate
+/// - `follow_up_not_supported`: chosen executor does not support follow-up
+/// - `spawn_failed`: retryable IO / spawn failure
+/// - `internal`: fallback for everything else
+pub fn executor_error_envelope(
+    err: &executors::executors::ExecutorError,
+    stderr_tail: Option<String>,
+    program: Option<String>,
+) -> ApiErrorEnvelope {
+    use executors::executors::ExecutorError::*;
+    let (kind, retryable, human) = match err {
+        ExecutableNotFound { .. } => ("executor_not_found", false, true),
+        AuthRequired(_) => ("auth_required", false, true),
+        FollowUpNotSupported(_) => ("follow_up_not_supported", false, false),
+        SpawnError(_) | Io(_) => ("spawn_failed", true, false),
+        SetupHelperNotSupported => ("internal", false, true),
+        _ => ("internal", true, false),
+    };
+    let program = program.or_else(|| match err {
+        ExecutableNotFound { program } => Some(program.clone()),
+        _ => None,
+    });
+    ApiErrorEnvelope {
+        kind: kind.to_string(),
+        retryable,
+        human_intervention_required: human,
+        stderr_tail,
+        program,
+    }
+}
+
+/// Map a `ContainerError` into an `ApiError`, attaching executor failure
+/// context (stderr tail + program) when the underlying error is an
+/// `ExecutorError`. All other container errors fall through to the default
+/// `From<ContainerError> for ApiError` conversion.
+pub(crate) fn map_container_err_with_context(
+    e: ContainerError,
+    ctx: Option<services::services::container::ExecutorFailureContext>,
+) -> ApiError {
+    if let ContainerError::ExecutorError(ref exe_err) = e {
+        let ctx = ctx.unwrap_or_default();
+        ApiError::ExecutorWithContext {
+            message: exe_err.to_string(),
+            envelope: executor_error_envelope(exe_err, ctx.stderr_tail, ctx.program),
+        }
+    } else {
+        ApiError::from(e)
     }
 }
 
@@ -261,6 +330,7 @@ fn remote_client_error(err: &RemoteClientError) -> ErrorInfo {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             error_type: "RemoteClientError",
             message: Some("Failed to persist credentials locally. Please retry.".into()),
+            envelope: None,
         },
         RemoteClientError::Api(code) => {
             let (status, msg) = match code {
@@ -446,6 +516,7 @@ impl IntoResponse for ApiError {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
                 error_type: "FileError",
                 message: Some("Failed to process file. Please try again.".into()),
+                envelope: None,
             },
 
             ApiError::EditorOpen(EditorOpenError::LaunchFailed { .. }) => {
@@ -495,7 +566,18 @@ impl IntoResponse for ApiError {
 
             ApiError::Deployment(_) => ErrorInfo::internal("DeploymentError"),
             ApiError::Container(_) => ErrorInfo::internal("ContainerError"),
-            ApiError::Executor(_) => ErrorInfo::internal("ExecutorError"),
+            ApiError::Executor(e) => ErrorInfo {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                error_type: "ExecutorError",
+                message: Some(e.to_string()),
+                envelope: Some(executor_error_envelope(e, None, None)),
+            },
+            ApiError::ExecutorWithContext { message, envelope } => ErrorInfo {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                error_type: "ExecutorError",
+                message: Some(message.clone()),
+                envelope: Some(envelope.clone()),
+            },
             ApiError::CommandBuilder(_) => ErrorInfo::internal("CommandBuildError"),
             ApiError::Database(_) => ErrorInfo::internal("DatabaseError"),
             ApiError::Worktree(err) => ErrorInfo::with_status(
@@ -535,7 +617,11 @@ impl IntoResponse for ApiError {
         let message = info
             .message
             .unwrap_or_else(|| format!("{}: {}", info.error_type, self));
-        let response = ApiResponse::<()>::error(&message);
+        let response = if let Some(envelope) = info.envelope {
+            ApiResponse::<()>::error_with_envelope(&message, envelope)
+        } else {
+            ApiResponse::<()>::error(&message)
+        };
         (info.status, Json(response)).into_response()
     }
 }
@@ -627,5 +713,152 @@ impl From<RelayPairingClientError> for ApiError {
                 ApiError::BadGateway(err.to_string())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::response::IntoResponse;
+    use executors::executors::ExecutorError;
+
+    use super::*;
+
+    #[test]
+    fn classifies_executable_not_found() {
+        let err = ExecutorError::ExecutableNotFound {
+            program: "claude".to_string(),
+        };
+        let env = executor_error_envelope(&err, None, None);
+        assert_eq!(env.kind, "executor_not_found");
+        assert!(!env.retryable);
+        assert!(env.human_intervention_required);
+        assert_eq!(env.program.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn classifies_auth_required() {
+        let err = ExecutorError::AuthRequired("token expired".into());
+        let env = executor_error_envelope(&err, None, None);
+        assert_eq!(env.kind, "auth_required");
+        assert!(!env.retryable);
+        assert!(env.human_intervention_required);
+    }
+
+    #[test]
+    fn classifies_follow_up_not_supported() {
+        let err = ExecutorError::FollowUpNotSupported("gemini".into());
+        let env = executor_error_envelope(&err, None, None);
+        assert_eq!(env.kind, "follow_up_not_supported");
+        assert!(!env.retryable);
+        assert!(!env.human_intervention_required);
+    }
+
+    #[test]
+    fn classifies_spawn_error_as_retryable() {
+        let err = ExecutorError::Io(std::io::Error::other("boom"));
+        let env = executor_error_envelope(&err, None, None);
+        assert_eq!(env.kind, "spawn_failed");
+        assert!(env.retryable);
+        assert!(!env.human_intervention_required);
+    }
+
+    #[test]
+    fn classifies_spawn_error_variant_as_retryable() {
+        let err = ExecutorError::SpawnError(std::io::Error::other("boom"));
+        let env = executor_error_envelope(&err, None, None);
+        assert_eq!(env.kind, "spawn_failed");
+        assert!(env.retryable);
+        assert!(!env.human_intervention_required);
+    }
+
+    #[test]
+    fn unknown_variants_fall_through_to_internal() {
+        let err = ExecutorError::UnknownExecutorType("foo".into());
+        let env = executor_error_envelope(&err, None, None);
+        assert_eq!(env.kind, "internal");
+        assert!(env.retryable);
+    }
+
+    #[test]
+    fn envelope_carries_stderr_tail_and_program() {
+        let err = ExecutorError::AuthRequired("expired".into());
+        let env = executor_error_envelope(
+            &err,
+            Some("last stderr line".to_string()),
+            Some("claude".to_string()),
+        );
+        assert_eq!(env.stderr_tail.as_deref(), Some("last stderr line"));
+        assert_eq!(env.program.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn classifies_setup_helper_not_supported_as_permanent() {
+        let err = ExecutorError::SetupHelperNotSupported;
+        let env = executor_error_envelope(&err, None, None);
+        assert_eq!(env.kind, "internal");
+        assert!(
+            !env.retryable,
+            "setup helper gap is permanent, not retryable"
+        );
+        assert!(
+            env.human_intervention_required,
+            "operator must switch executor — human intervention required"
+        );
+    }
+
+    #[tokio::test]
+    async fn executor_error_response_carries_envelope() {
+        let err: ApiError = ExecutorError::AuthRequired("expired".into()).into();
+        let response = err.into_response();
+        let (parts, body) = response.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parts.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(json["success"], false);
+        assert_eq!(json["error"]["kind"], "auth_required");
+        assert_eq!(json["error"]["retryable"], false);
+        assert_eq!(json["error"]["human_intervention_required"], true);
+    }
+
+    #[tokio::test]
+    async fn executor_with_context_response_carries_stderr_and_program() {
+        use utils::response::ApiErrorEnvelope;
+        let envelope = ApiErrorEnvelope {
+            kind: "executor_not_found".into(),
+            retryable: false,
+            human_intervention_required: true,
+            stderr_tail: Some("…last line of stderr".to_string()),
+            program: Some("nonexistent-bin".into()),
+        };
+        let err = ApiError::ExecutorWithContext {
+            message: ExecutorError::ExecutableNotFound {
+                program: "nonexistent-bin".into(),
+            }
+            .to_string(),
+            envelope: envelope.clone(),
+        };
+        let response = err.into_response();
+        let (parts, body) = response.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parts.status, axum::http::StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(json["success"], false);
+        assert_eq!(json["error"]["kind"], "executor_not_found");
+        assert_eq!(json["error"]["stderr_tail"], "…last line of stderr");
+        assert_eq!(json["error"]["program"], "nonexistent-bin");
+    }
+
+    #[tokio::test]
+    async fn non_executor_error_has_no_envelope() {
+        let err: ApiError = ApiError::BadRequest("bad".into());
+        let response = err.into_response();
+        let (_, body) = response.into_parts();
+        let bytes = axum::body::to_bytes(body, usize::MAX).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        // envelope optional; BadRequest does not populate it
+        assert!(
+            json.get("error").is_none(),
+            "expected `error` key to be absent due to skip_serializing_if, got: {json}"
+        );
     }
 }
