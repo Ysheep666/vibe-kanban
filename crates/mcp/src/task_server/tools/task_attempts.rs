@@ -461,6 +461,94 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn workspace_mode_link_workspace_issue_allows_scoped_workspace() {
+        // Complement the negative-path test above: when the caller targets
+        // the *scoped* workspace, the guard must not short-circuit — the
+        // tool must reach the issue lookup and the link mutation, and return
+        // success. Lock this in so a future refactor can't accidentally
+        // widen the guard to also deny the scope itself.
+        install_rustls();
+        let mock = MockServer::start();
+        let scope = Uuid::new_v4();
+        let issue_id = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let status_id = Uuid::new_v4();
+
+        // `workspace_id == scope` → `check_scope_allows_workspace` returns
+        // true immediately without any HTTP round-trip. Any GET against
+        // `/api/workspaces/{scope}` in this test would indicate the guard
+        // started climbing a parent chain it should not — catch-all 500s
+        // make that regression surface loudly.
+        let scope_guard = mock.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/api/workspaces/{scope}"));
+            then.status(500);
+        });
+
+        let issue_hit = mock.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/api/remote/issues/{issue_id}"));
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": {
+                    "id": issue_id.to_string(),
+                    "project_id": project_id.to_string(),
+                    "issue_number": 1,
+                    "simple_id": "ABC-1",
+                    "status_id": status_id.to_string(),
+                    "title": "test issue",
+                    "description": null,
+                    "priority": null,
+                    "start_date": null,
+                    "target_date": null,
+                    "completed_at": null,
+                    "sort_order": 1.0,
+                    "parent_issue_id": null,
+                    "parent_issue_sort_order": null,
+                    "extension_metadata": {},
+                    "creator_user_id": null,
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z",
+                }
+            }));
+        });
+
+        // The link endpoint is the mutation under test — assert it got the
+        // expected JSON body, not just that it was hit.
+        let link_hit = mock.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path(format!("/api/workspaces/{scope}/links"))
+                .json_body(serde_json::json!({
+                    "project_id": project_id.to_string(),
+                    "issue_id": issue_id.to_string(),
+                }));
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": null,
+            }));
+        });
+
+        let server = McpServer::new_workspace(&mock.base_url()).with_scope_for_test(scope);
+        let req = LinkWorkspaceIssueRequest {
+            workspace_id: scope,
+            issue_id,
+        };
+        let result = server.link_workspace_issue(Parameters(req)).await.unwrap();
+
+        assert!(
+            !result.is_error.unwrap_or(false),
+            "in-scope link_workspace_issue must succeed, got error: {result:?}",
+        );
+        assert_eq!(
+            scope_guard.hits(),
+            0,
+            "self-scope target must not trigger a parent-chain climb",
+        );
+        assert_eq!(issue_hit.hits(), 1, "issue lookup must fire on success path");
+        assert_eq!(link_hit.hits(), 1, "link mutation must fire on success path");
+    }
+
+    #[tokio::test]
     async fn workspace_mode_start_workspace_rejects_unrelated_parent() {
         // `start_workspace` with `parent_workspace_id` routes through
         // `POST /api/tasks/start` just like `create_and_start_task` — and
