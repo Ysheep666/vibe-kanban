@@ -214,6 +214,10 @@ Allowed status values: `todo`, `inprogress`, `inreview`, `done`, `cancelled`.
 In Workspace and Orchestrator modes, `parent_workspace_id` defaults to the scoped workspace when omitted. Passing an explicit parent that falls outside the scoped workspace or its descendant chain is rejected with `error_kind="scope_denied"`. In Global mode, `parent_workspace_id` is required on `list_tasks` and accepted without scope checks on the create tools.
 </Note>
 
+<Tip>
+For an end-to-end walkthrough that uses these tools to let a parent coding agent spawn and supervise children, see the [Orchestrator Pattern tutorial](/integrations/mcp-orchestrator-pattern).
+</Tip>
+
 ### Supported Executors
 
 When using `start_workspace`, the following executors are supported (case-insensitive, accepts hyphens or underscores):

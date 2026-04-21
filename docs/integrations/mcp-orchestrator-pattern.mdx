@@ -1,0 +1,287 @@
+---
+title: "Parent Agents Spawning Child Tasks"
+description: "Use Vibe Kanban's MCP task tools to let one coding agent break work into child tasks, launch them, and supervise their runs."
+---
+
+This walkthrough shows how to use Vibe Kanban's MCP server to run a
+"parent" coding agent that plans work, spawns **child tasks**, and
+observes each child's progress — all from inside a single workspace
+session. It complements the
+[Vibe Kanban MCP Server](/integrations/vibe-kanban-mcp-server) tool
+reference by stitching the task-orchestration tools into an end-to-end
+pattern.
+
+<Info>
+This pattern relies on **Workspace** mode, which is the default for
+fresh installs. See [MCP Modes Reference](/integrations/mcp-modes) for
+the full mode comparison.
+</Info>
+
+## What orchestration looks like
+
+A parent session running a coding agent — typically Claude Code, Codex,
+or Gemini CLI launched from a Vibe Kanban worktree — can call the MCP
+server to:
+
+1. **Break a goal into sub-tasks** — the agent reasons about the work,
+   then creates one VK task per unit.
+2. **Launch each task in its own workspace** — `create_and_start_task`
+   atomically creates the task row, provisions a git worktree, and
+   starts a child coding-agent session.
+3. **Observe children in flight** — `list_tasks` and
+   `read_session_messages` expose each child's status and streamed
+   conversation.
+4. **Steer or finish children** — `run_session_prompt` pushes a new
+   prompt into a child session; `update_task_status` promotes tasks
+   through the `todo → inprogress → inreview → done` lifecycle.
+
+The parent never execs the child directly. It hands the child off to
+VK's executor framework, which owns the worktree, dev server, and
+session lifecycle.
+
+## Prerequisites
+
+Before you start, confirm the following:
+
+<Steps>
+<Step title="Vibe Kanban is running locally">
+The MCP server is a stdio process launched by your coding agent. It
+connects to the local Vibe Kanban backend, so VK must be running
+before the parent agent starts a session.
+</Step>
+
+<Step title="The parent agent launches from a VK worktree">
+Workspace mode auto-scopes the MCP server to the VK worktree your
+coding agent was launched from. If the CWD does not match a VK
+worktree, the mode gracefully falls back to Global-equivalent
+behaviour and you lose both the scope guard and the task tools'
+default `parent_workspace_id`.
+</Step>
+
+<Step title="The parent agent's MCP config uses Workspace mode">
+Either omit `--mode` (defaults to Workspace) or set it explicitly:
+
+```json
+{
+  "mcpServers": {
+    "vibe_kanban": {
+      "command": "npx",
+      "args": ["-y", "vibe-kanban@latest", "--mcp", "--mode", "workspace"]
+    }
+  }
+}
+```
+
+Add this to the coding agent's MCP configuration — either through
+**Settings → MCP Servers** inside Vibe Kanban (recommended for
+agents that run inside VK) or by editing the agent's config file
+directly.
+</Step>
+</Steps>
+
+## Walkthrough: plan, spawn, observe
+
+Assume the parent agent's goal is "build a profile page with avatar
+upload, bio editor, and display-name validation". The parent should
+create three child tasks and run them concurrently.
+
+<Steps>
+<Step title="Parent agent creates child tasks and starts them">
+The parent calls `create_and_start_task` once per sub-task. Because
+Workspace mode defaults `parent_workspace_id` to the scoped
+workspace, you can omit that field — VK wires the parent-child link
+automatically.
+
+```json
+{
+  "name": "create_and_start_task",
+  "arguments": {
+    "title": "Avatar upload endpoint",
+    "prompt": "Implement POST /api/users/:id/avatar. Validate MIME, store in S3, return URL.",
+    "executor": "claude-code",
+    "repositories": [
+      { "repo_id": "8e3c…", "branch": "main" }
+    ]
+  }
+}
+```
+
+Response shape:
+
+```json
+{
+  "task_id":      "…",
+  "workspace_id": "…",
+  "session_id":   "…",
+  "execution_id": "…"
+}
+```
+
+Repeat for `"Bio editor component"` and `"Display-name validation"`.
+
+<Tip>
+Pick the `executor` per child based on what the sub-task needs. A
+frontend child might use Claude Code while a one-shot script child
+uses Codex. The parent does not need to match.
+</Tip>
+</Step>
+
+<Step title="Parent lists its children to check status">
+`list_tasks` with no arguments returns every task whose
+`parent_workspace_id` matches the scoped workspace.
+
+```json
+{ "name": "list_tasks", "arguments": {} }
+```
+
+Each row surfaces `status`, `title`, `task_id`, and
+`workspace_id`. Poll this periodically, or react when a child's
+session emits a terminal message.
+</Step>
+
+<Step title="Parent reads a child's conversation">
+When a child finishes (or gets stuck), the parent inspects its
+session log:
+
+```json
+{
+  "name": "read_session_messages",
+  "arguments": {
+    "workspace_id": "<child workspace_id>",
+    "last_n": 20,
+    "include_thinking": false
+  }
+}
+```
+
+The response includes `final_assistant_message`, which is usually
+the completion summary you want.
+
+<Note>
+`session_id` defaults to the most recently used session in the
+workspace when omitted, so for a fresh child you can pass
+`workspace_id` alone.
+</Note>
+</Step>
+
+<Step title="Parent steers or closes children">
+To push a follow-up into a still-running child session:
+
+```json
+{
+  "name": "run_session_prompt",
+  "arguments": {
+    "session_id": "<child session_id>",
+    "prompt": "Also add a rate-limit header to the endpoint."
+  }
+}
+```
+
+To mark a child task done once the diff is reviewed:
+
+```json
+{
+  "name": "update_task_status",
+  "arguments": {
+    "task_id": "<child task_id>",
+    "status":  "done"
+  }
+}
+```
+
+Valid statuses are `todo`, `inprogress`, `inreview`, `done`, and
+`cancelled`.
+</Step>
+</Steps>
+
+## Safety rails
+
+Workspace mode enforces two independent guards that protect parent
+orchestrators from misbehaving child logic.
+
+### Scope guard
+
+Mutations naming a workspace, repo, or task outside the parent's
+scoped workspace (or its descendant chain) are rejected with
+`error_kind = "scope_denied"`.
+
+```json
+{
+  "error_kind": "scope_denied",
+  "message": "Operation is outside the configured workspace scope",
+  "details": "requested task_id=<id>, configured workspace_id=<parent>"
+}
+```
+
+When this fires, the parent agent tried to touch a resource it does
+not own. In practice this stops prompt-injection-style escapes from
+mutating unrelated workspaces.
+
+<Note>
+Read tools (`list_*`, `get_*`) never trigger scope denial — an agent
+must be able to discover resources before acting on them. Only
+mutations are guarded.
+</Note>
+
+### Child concurrency cap
+
+`/api/tasks/start` enforces a per-parent cap on **running** child
+workspaces. The limit comes from `VK_MAX_CHILDREN_PER_PARENT` and
+defaults to `5`.
+
+When the parent already has the limit's worth of running children,
+the next `create_and_start_task` call is rejected with HTTP 429 and
+`error_kind = "parent_concurrency_exceeded"`. The parent should
+handle this by waiting for at least one child to finish before
+spawning more.
+
+<Tabs>
+<Tab title="Raise the cap">
+Set the env var on the Vibe Kanban backend before starting it:
+
+```bash
+export VK_MAX_CHILDREN_PER_PARENT=12
+```
+</Tab>
+<Tab title="Keep the default">
+Leave the var unset. The parent should poll `list_tasks` and only
+spawn more children once a running child reaches a terminal status.
+</Tab>
+</Tabs>
+
+<Warning>
+The cap is best-effort. Two concurrent `create_and_start_task` calls
+can both observe room and both succeed, temporarily exceeding the
+limit by one. For hard guarantees, serialise the parent's spawn
+calls.
+</Warning>
+
+## Error handling checklist
+
+| `error_kind`                    | Likely cause                                                           | Parent response |
+|---------------------------------|------------------------------------------------------------------------|-----------------|
+| `scope_denied`                  | Child tool called with an ID outside the scoped workspace              | Log and skip — this is usually an agent mistake |
+| `parent_concurrency_exceeded`   | Too many running children                                              | Wait for a child to finish, then retry |
+| Transport / timeout             | Backend unreachable or child workspace setup script failed             | Inspect `get_execution` for the failing `execution_id` |
+
+## Observability tips
+
+- **`list_sessions`** and **`list_tasks`** are cheap — lean on them
+  for polling loops rather than repeatedly calling
+  `read_session_messages`.
+- **`get_execution`** returns the final status of a single execution
+  (setup, run, cleanup). Use it when a child reports failure.
+- Prefer `include_thinking=false` (the default) for `read_session_messages` unless you specifically need the
+  agent's reasoning trace — it roughly halves the response size.
+
+## See also
+
+- [Vibe Kanban MCP Server](/integrations/vibe-kanban-mcp-server) — the
+  complete tool reference, including parameters and return shapes.
+- [MCP Modes Reference](/integrations/mcp-modes) — Workspace vs.
+  Global vs. Orchestrator, with the scope-guard decision tree.
+- [Connecting MCP Servers](/integrations/mcp-server-configuration) —
+  how to wire the VK MCP server into a coding agent inside Vibe
+  Kanban.
+- [Agent Configurations](/settings/agent-configurations) — custom
+  profiles for planning-focused parent agents.

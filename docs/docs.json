@@ -115,7 +115,8 @@
           "integrations/vscode-extension",
           "integrations/mcp-server-configuration",
           "integrations/mcp-modes",
-          "integrations/vibe-kanban-mcp-server"
+          "integrations/vibe-kanban-mcp-server",
+          "integrations/mcp-orchestrator-pattern"
         ]
       },
       {
