@@ -224,10 +224,13 @@ impl McpServer {
         }
         let parent = match task.parent_workspace_id {
             Some(p) => p,
-            None => return Err(self.scope_denied_error(task.id)),
+            // Top-level task in Workspace/Orchestrator mode with scope set →
+            // denied. Render `task.id` as `task_id=` — not `workspace_id=` —
+            // so operators reading the error chase the right row.
+            None => return Err(self.scope_denied_task_error(task.id)),
         };
         if !check_scope_allows_workspace(self, scope_cache, parent).await {
-            return Err(self.scope_denied_error(task.id));
+            return Err(self.scope_denied_task_error(task.id));
         }
         Ok(())
     }
@@ -734,11 +737,27 @@ mod tests {
 
         let mut cache = std::collections::HashMap::new();
         let result = server.require_parent_in_scope(&task, &mut cache).await;
-        assert!(
-            result.is_err(),
+        let err = result.expect_err(
             "Workspace-mode with scope set must reject tasks that have no parent_workspace_id",
         );
         assert_eq!(catch_all.hits(), 0);
+
+        // `require_parent_in_scope` operates on a task — the rendered detail
+        // line must label the offending id as `task_id=`, not `workspace_id=`.
+        // Otherwise operators reading the error payload would go chase a
+        // workspace that never existed.
+        let details = err
+            .details
+            .as_deref()
+            .expect("scope_denied error must carry a details line");
+        assert!(
+            details.contains(&format!("requested task_id={}", task.id)),
+            "details should label the offending id as task_id, got: {details}",
+        );
+        assert!(
+            !details.contains("requested workspace_id="),
+            "details must not mislabel a task id as workspace_id, got: {details}",
+        );
     }
 
     #[tokio::test]
@@ -797,9 +816,23 @@ mod tests {
 
         let mut cache = std::collections::HashMap::new();
         let result = server.require_parent_in_scope(&task, &mut cache).await;
-        assert!(
-            result.is_err(),
+        let err = result.expect_err(
             "Workspace-mode with scope set must reject tasks whose parent chain does not reach the scope",
+        );
+
+        // Same labelling invariant as the no-parent case: a task-scope guard
+        // must report the failing id as `task_id=`, not `workspace_id=`.
+        let details = err
+            .details
+            .as_deref()
+            .expect("scope_denied error must carry a details line");
+        assert!(
+            details.contains(&format!("requested task_id={}", task.id)),
+            "details should label the offending id as task_id, got: {details}",
+        );
+        assert!(
+            !details.contains("requested workspace_id="),
+            "details must not mislabel a task id as workspace_id, got: {details}",
         );
     }
 
