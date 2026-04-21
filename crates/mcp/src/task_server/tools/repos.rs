@@ -572,7 +572,10 @@ mod tests {
     /// Decode a `CallToolResult` error body as JSON so `error_kind` can be
     /// asserted structurally. Mirrors the helper in `remote_tags.rs`.
     fn error_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
-        assert!(result.is_error.unwrap_or(false), "expected error: {result:?}");
+        assert!(
+            result.is_error.unwrap_or(false),
+            "expected error: {result:?}"
+        );
         let text = match &result.content[0].raw {
             rmcp::model::RawContent::Text(t) => t.text.clone(),
             _ => panic!("expected text"),
