@@ -1,6 +1,4 @@
-use api_types::{
-    CreateIssueTagRequest, IssueTag, ListIssueTagsResponse, ListTagsResponse, MutationResponse,
-};
+use api_types::{CreateIssueTagRequest, IssueTag, ListIssueTagsResponse, MutationResponse};
 use rmcp::{
     ErrorData, handler::server::wrapper::Parameters, model::CallToolResult, schemars, tool,
     tool_router,
@@ -9,33 +7,6 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::McpServer;
-
-#[derive(Debug, Deserialize, schemars::JsonSchema)]
-struct McpListTagsRequest {
-    #[schemars(
-        description = "The project ID to list tags from. Optional if running inside a workspace linked to a remote project."
-    )]
-    project_id: Option<Uuid>,
-}
-
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-struct TagSummary {
-    #[schemars(description = "Tag ID")]
-    id: String,
-    #[schemars(description = "Project ID")]
-    project_id: String,
-    #[schemars(description = "Tag name")]
-    name: String,
-    #[schemars(description = "Tag color value")]
-    color: String,
-}
-
-#[derive(Debug, Serialize, schemars::JsonSchema)]
-struct McpListTagsResponse {
-    project_id: String,
-    tags: Vec<TagSummary>,
-    count: usize,
-}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct McpListIssueTagsRequest {
@@ -87,42 +58,6 @@ struct McpRemoveIssueTagResponse {
 
 #[tool_router(router = issue_tags_tools_router, vis = "pub")]
 impl McpServer {
-    #[tool(
-        description = "List tags for a project. `project_id` is optional if running inside a workspace linked to a remote project."
-    )]
-    async fn list_tags(
-        &self,
-        Parameters(McpListTagsRequest { project_id }): Parameters<McpListTagsRequest>,
-    ) -> Result<CallToolResult, ErrorData> {
-        let project_id = match self.resolve_project_id(project_id) {
-            Ok(id) => id,
-            Err(e) => return Ok(Self::tool_error(e)),
-        };
-
-        let url = self.url(&format!("/api/remote/tags?project_id={}", project_id));
-        let response: ListTagsResponse = match self.send_json(self.client.get(&url)).await {
-            Ok(r) => r,
-            Err(e) => return Ok(Self::tool_error(e)),
-        };
-
-        let tags = response
-            .tags
-            .into_iter()
-            .map(|tag| TagSummary {
-                id: tag.id.to_string(),
-                project_id: tag.project_id.to_string(),
-                name: tag.name,
-                color: tag.color,
-            })
-            .collect::<Vec<_>>();
-
-        McpServer::success(&McpListTagsResponse {
-            project_id: project_id.to_string(),
-            count: tags.len(),
-            tags,
-        })
-    }
-
     #[tool(description = "List tags attached to an issue.")]
     async fn list_issue_tags(
         &self,

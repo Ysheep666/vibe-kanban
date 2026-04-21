@@ -255,6 +255,7 @@ mod issue_tags;
 mod organizations;
 mod remote_issues;
 mod remote_projects;
+mod remote_tags;
 mod repos;
 mod sessions;
 mod task_attempts;
@@ -271,6 +272,7 @@ impl McpServer {
             + Self::remote_issues_tools_router()
             + Self::issue_assignees_tools_router()
             + Self::issue_tags_tools_router()
+            + Self::remote_tags_tools_router()
             + Self::issue_relationships_tools_router()
             + Self::task_attempts_tools_router()
             + Self::session_tools_router()
@@ -366,6 +368,95 @@ impl McpServer {
             .with_status(status.as_u16())
         })?;
         classify_response::<T>(status, body)
+    }
+
+    /// Send a request and decode a raw `MutationResponse<T>` (`{data, txid}`)
+    /// body — the shape returned by `/api/v1/*` mutation routes (those routes
+    /// do NOT wrap their success payload in `ApiResponse`; see
+    /// `mutation_response` in `crates/server/src/routes/v1.rs`). Non-2xx
+    /// responses are still parsed as `ApiResponseEnvelope` so the server's
+    /// `error_data` / `error_kind` flows through to the AI unchanged.
+    async fn send_mutation_response<T: DeserializeOwned>(
+        &self,
+        rb: reqwest::RequestBuilder,
+    ) -> Result<T, ToolError> {
+        let resp = rb.send().await.map_err(|error| {
+            ToolError::new("Failed to connect to VK API", Some(error.to_string()))
+        })?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(|error| {
+            ToolError::new(
+                format!(
+                    "Failed to read VK API response body (HTTP {})",
+                    status.as_u16()
+                ),
+                Some(error.to_string()),
+            )
+            .with_status(status.as_u16())
+        })?;
+
+        if !status.is_success() {
+            return Err(
+                match serde_json::from_str::<ApiResponseEnvelope<serde_json::Value>>(&body) {
+                    Ok(env) => envelope_to_error(env, status),
+                    Err(parse_err) => ToolError::new(
+                        format!("VK API returned HTTP {}", status.as_u16()),
+                        Some(parse_err.to_string()),
+                    )
+                    .with_status(status.as_u16())
+                    .with_body_tail(truncate_body_tail(&body)),
+                },
+            );
+        }
+
+        let envelope: api_types::MutationResponse<T> =
+            serde_json::from_str(&body).map_err(|parse_err| {
+                ToolError::new(
+                    "Failed to parse VK API mutation response",
+                    Some(parse_err.to_string()),
+                )
+                .with_status(status.as_u16())
+                .with_body_tail(truncate_body_tail(&body))
+            })?;
+        Ok(envelope.data)
+    }
+
+    /// Variant of `send_empty_json` for `/api/v1/*` DELETE routes that
+    /// return a bare `{"txid": 0}` on success (no `ApiResponse` envelope —
+    /// see `DeleteResponse` and `mutation_response` in
+    /// `crates/server/src/routes/v1.rs`). Non-2xx responses are still parsed
+    /// as `ApiResponseEnvelope` so the server's `error_data` / `error_kind`
+    /// (e.g. the tag-in-use conflict body) flows through to the AI intact.
+    async fn send_delete_raw(&self, rb: reqwest::RequestBuilder) -> Result<(), ToolError> {
+        let resp = rb.send().await.map_err(|error| {
+            ToolError::new("Failed to connect to VK API", Some(error.to_string()))
+        })?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(|error| {
+            ToolError::new(
+                format!(
+                    "Failed to read VK API response body (HTTP {})",
+                    status.as_u16()
+                ),
+                Some(error.to_string()),
+            )
+            .with_status(status.as_u16())
+        })?;
+
+        if !status.is_success() {
+            return Err(
+                match serde_json::from_str::<ApiResponseEnvelope<serde_json::Value>>(&body) {
+                    Ok(env) => envelope_to_error(env, status),
+                    Err(parse_err) => ToolError::new(
+                        format!("VK API returned HTTP {}", status.as_u16()),
+                        Some(parse_err.to_string()),
+                    )
+                    .with_status(status.as_u16())
+                    .with_body_tail(truncate_body_tail(&body)),
+                },
+            );
+        }
+        Ok(())
     }
 
     async fn send_empty_json(&self, rb: reqwest::RequestBuilder) -> Result<(), ToolError> {
@@ -635,6 +726,17 @@ mod tests {
         let names = tool_names(McpServer::global_mode_router());
         assert!(names.contains("add_repo"));
         assert!(names.contains("delete_repo"));
+    }
+
+    #[test]
+    fn global_mode_registers_remote_tag_tools() {
+        let names = tool_names(McpServer::global_mode_router());
+        for expected in ["list_tags", "create_tag", "update_tag", "delete_tag"] {
+            assert!(
+                names.contains(expected),
+                "missing {expected} in global router"
+            );
+        }
     }
 
     #[test]

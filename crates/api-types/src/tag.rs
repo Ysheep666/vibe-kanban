@@ -40,3 +40,9 @@ pub struct ListTagsQuery {
 pub struct ListTagsResponse {
     pub tags: Vec<Tag>,
 }
+
+#[derive(Debug, Serialize, TS)]
+pub struct DeleteTagConflict {
+    pub message: String,
+    pub issue_tag_count: i64,
+}

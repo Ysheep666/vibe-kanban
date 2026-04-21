@@ -779,17 +779,63 @@ async fn update_tag(
     Ok(ResponseJson(mutation_response(tag)))
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct DeleteTagQuery {
+    #[serde(default)]
+    force: bool,
+}
+
+/// Delete a tag.
+///
+/// Response shape is kept as raw JSON (not wrapped in `ApiResponse`) so that:
+/// - On success, the frontend Electric `onDelete` reader (which expects a
+///   bare `{"txid": 0}` — see
+///   `packages/web-core/src/shared/lib/electric/collections.ts`) keeps
+///   working.
+/// - On 409 conflict, the body follows the `ApiResponse` error envelope
+///   shape (`{success: false, message, error_data: DeleteTagConflict}`) so
+///   the MCP `delete_tag` tool surfaces `error_data.issue_tag_count` to the
+///   AI caller via its standard envelope-to-error path.
 async fn delete_tag(
     State(deployment): State<DeploymentImpl>,
     Path(id): Path<Uuid>,
-) -> Result<ResponseJson<DeleteResponse>, ApiError> {
+    Query(query): Query<DeleteTagQuery>,
+) -> Result<(axum::http::StatusCode, ResponseJson<Value>), ApiError> {
     let pool = deployment.db().pool.clone();
+
+    if !query.force {
+        let count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM remote_issue_tags WHERE tag_id = ?1")
+                .bind(id)
+                .fetch_one(&pool)
+                .await
+                .map_err(ApiError::Database)?;
+        if count > 0 {
+            return Ok((
+                axum::http::StatusCode::CONFLICT,
+                ResponseJson(json!({
+                    "success": false,
+                    "message": format!(
+                        "Tag is referenced by {count} issue_tag(s). Retry with ?force=true to cascade-delete."
+                    ),
+                    "error_data": {
+                        "message": format!("Tag is referenced by {count} issue_tag(s)."),
+                        "issue_tag_count": count,
+                    }
+                })),
+            ));
+        }
+    }
+
     sqlx::query("DELETE FROM remote_tags WHERE id = ?1")
         .bind(id)
         .execute(&pool)
         .await
         .map_err(ApiError::Database)?;
-    Ok(ResponseJson(DeleteResponse { txid: 0 }))
+    Ok((
+        axum::http::StatusCode::OK,
+        ResponseJson(json!({ "txid": 0 })),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -903,5 +949,22 @@ fn parse_relationship_type(s: &str) -> api_types::IssueRelationshipType {
         "blocking" => R::Blocking,
         "has_duplicate" => R::HasDuplicate,
         _ => R::Related,
+    }
+}
+
+#[cfg(test)]
+mod delete_tag_query_tests {
+    use super::DeleteTagQuery;
+
+    #[test]
+    fn force_defaults_false() {
+        let q: DeleteTagQuery = serde_urlencoded::from_str("").unwrap();
+        assert!(!q.force);
+    }
+
+    #[test]
+    fn force_true_parses() {
+        let q: DeleteTagQuery = serde_urlencoded::from_str("force=true").unwrap();
+        assert!(q.force);
     }
 }

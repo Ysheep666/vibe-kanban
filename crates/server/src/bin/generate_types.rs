@@ -101,6 +101,7 @@ fn generate_types_content() -> String {
         api_types::ListMembersResponse::decl(),
         api_types::UpdateMemberRoleRequest::decl(),
         api_types::UpdateMemberRoleResponse::decl(),
+        api_types::DeleteTagConflict::decl(),
         server::routes::repo::RegisterRepoRequest::decl(),
         server::routes::repo::InitRepoRequest::decl(),
         server::routes::tags::TagSearchParams::decl(),
