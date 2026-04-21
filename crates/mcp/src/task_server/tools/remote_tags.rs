@@ -172,7 +172,9 @@ impl McpServer {
         })
     }
 
-    #[tool(description = "Update a tag's name and/or color. At least one field must be provided.")]
+    #[tool(
+        description = "Update a tag's name and/or color. At least one field must be provided. Fails if the tag belongs to a different project than the caller's workspace context."
+    )]
     async fn update_tag(
         &self,
         Parameters(UpdateTagArgs {
@@ -185,6 +187,9 @@ impl McpServer {
             return Ok(Self::tool_error(ToolError::message(
                 "No fields to update (provide at least one of `name`, `color`)",
             )));
+        }
+        if let Err(e) = self.require_tag_in_scope(tag_id, "update").await {
+            return Ok(Self::tool_error(e));
         }
         // Only include fields the caller actually provided so the backend's
         // `#[serde(default, deserialize_with = "some_if_present")]` keeps
@@ -214,12 +219,15 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Delete a tag. When issue_tags reference this tag, rejects with a 409 envelope whose error_data = {message, issue_tag_count} lists how many references block the delete; pass force=true to cascade-delete the relation rows. Future server releases may also set error_kind on that envelope."
+        description = "Delete a tag. When issue_tags reference this tag, rejects with a 409 envelope whose error_data = {message, issue_tag_count} lists how many references block the delete; pass force=true to cascade-delete the relation rows. Future server releases may also set error_kind on that envelope. Fails if the tag belongs to a different project than the caller's workspace context."
     )]
     async fn delete_tag(
         &self,
         Parameters(DeleteTagArgs { tag_id, force }): Parameters<DeleteTagArgs>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(e) = self.require_tag_in_scope(tag_id, "delete").await {
+            return Ok(Self::tool_error(e));
+        }
         let url = self.url(&format!("/api/v1/tags/{}", tag_id));
         let mut req = self.client.delete(&url);
         if force.unwrap_or(false) {
@@ -232,6 +240,39 @@ impl McpServer {
             success: true,
             tag_id: tag_id.to_string(),
         })
+    }
+}
+
+impl McpServer {
+    /// Cross-project scope guard for `update_tag` / `delete_tag`.
+    ///
+    /// Mirrors the guard `create_tag` applies up-front (lines 138-150):
+    /// when the caller's workspace context pins a `project_id`, refuse
+    /// to mutate a tag owned by a different project. Because these
+    /// tools only receive a `tag_id`, we have to resolve the owning
+    /// project first via the read-only `GET /api/remote/tags/{id}`
+    /// endpoint. `Ok(())` means "safe to proceed" (no context, no
+    /// scoped project, or the projects match); `Err` short-circuits
+    /// the caller with a scope-denied `ToolError`.
+    async fn require_tag_in_scope(&self, tag_id: Uuid, verb: &str) -> Result<(), ToolError> {
+        let Some(ctx) = &self.context else {
+            return Ok(());
+        };
+        let Some(scoped_project) = ctx.project_id else {
+            return Ok(());
+        };
+        let url = self.url(&format!("/api/remote/tags/{}", tag_id));
+        let tag: Tag = self.send_json(self.client.get(&url)).await?;
+        if tag.project_id != scoped_project {
+            return Err(ToolError::new(
+                format!("Cannot {verb} tag outside the current workspace's project",),
+                Some(format!(
+                    "tag project_id={}, scoped project_id={}",
+                    tag.project_id, scoped_project
+                )),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -258,6 +299,21 @@ mod tests {
                 "created_at": "2025-01-01T00:00:00Z"
             },
             "txid": 0
+        })
+    }
+
+    /// `ApiResponse<Tag>` envelope — the shape `GET /api/remote/tags/{id}`
+    /// returns, which `require_tag_in_scope` depends on.
+    fn tag_read_envelope(id: Uuid, project_id: Uuid, name: &str, color: &str) -> serde_json::Value {
+        serde_json::json!({
+            "success": true,
+            "data": {
+                "id": id.to_string(),
+                "project_id": project_id.to_string(),
+                "name": name,
+                "color": color,
+            },
+            "message": null
         })
     }
 
@@ -369,6 +425,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_tag_rejects_cross_project_when_scoped() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let tid = Uuid::new_v4();
+        let scoped_project = Uuid::new_v4();
+        let foreign_project = Uuid::new_v4();
+
+        // GET /api/remote/tags/{id} — the scope guard's lookup. Returns a
+        // tag whose project_id differs from the caller's scoped project.
+        let lookup = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/api/remote/tags/{tid}"));
+            then.status(200).json_body(tag_read_envelope(
+                tid,
+                foreign_project,
+                "foreign",
+                "#ABCDEF",
+            ));
+        });
+        // PATCH /api/v1/tags/{id} — the mutation endpoint. Must NOT be
+        // called; guard short-circuits before this. Rigged to 500 so a
+        // leaked call would flip the test red loudly.
+        let mutation = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::PATCH)
+                .path(format!("/api/v1/tags/{tid}"));
+            then.status(500);
+        });
+
+        let mut server =
+            McpServer::new_workspace(&mock_server.base_url()).with_scope_for_test(Uuid::new_v4());
+        if let Some(ctx) = server.context.as_mut() {
+            ctx.project_id = Some(scoped_project);
+        }
+
+        let req = UpdateTagArgs {
+            tag_id: tid,
+            name: Some("new-name".to_string()),
+            color: None,
+        };
+        let result = server
+            .update_tag(Parameters(req))
+            .await
+            .expect("must return error tool result");
+        assert!(result.is_error.unwrap_or(false));
+        lookup.assert_hits(1);
+        assert_eq!(mutation.hits(), 0);
+    }
+
+    #[tokio::test]
     async fn delete_tag_rejects_in_use_without_force() {
         install_rustls();
         let mock_server = MockServer::start();
@@ -434,5 +539,52 @@ mod tests {
             .await
             .expect("must succeed");
         mock.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn delete_tag_rejects_cross_project_when_scoped() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let tid = Uuid::new_v4();
+        let scoped_project = Uuid::new_v4();
+        let foreign_project = Uuid::new_v4();
+
+        // GET /api/remote/tags/{id} — scope guard lookup. Tag belongs to a
+        // different project than the caller's workspace scope.
+        let lookup = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/api/remote/tags/{tid}"));
+            then.status(200).json_body(tag_read_envelope(
+                tid,
+                foreign_project,
+                "foreign",
+                "#ABCDEF",
+            ));
+        });
+        // DELETE /api/v1/tags/{id} — must NOT be called; guard short-
+        // circuits before the mutation. Rigged to 500 so a leaked call
+        // fails loudly.
+        let mutation = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE)
+                .path(format!("/api/v1/tags/{tid}"));
+            then.status(500);
+        });
+
+        let mut server =
+            McpServer::new_workspace(&mock_server.base_url()).with_scope_for_test(Uuid::new_v4());
+        if let Some(ctx) = server.context.as_mut() {
+            ctx.project_id = Some(scoped_project);
+        }
+
+        let result = server
+            .delete_tag(Parameters(DeleteTagArgs {
+                tag_id: tid,
+                force: None,
+            }))
+            .await
+            .expect("must return error tool result");
+        assert!(result.is_error.unwrap_or(false));
+        lookup.assert_hits(1);
+        assert_eq!(mutation.hits(), 0);
     }
 }
