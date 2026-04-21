@@ -5,6 +5,28 @@ description: "Configure the Vibe Kanban MCP server"
 
 Vibe Kanban exposes a local MCP (Model Context Protocol) server, allowing you to manage organisations, projects, issues, workspaces, and repositories from external MCP clients like Claude Desktop, Raycast, or even coding agents running within Vibe Kanban itself.
 
+## Modes at a glance
+
+<CardGroup cols={3}>
+  <Card title="Workspace (default)" icon="folder-open">
+  Auto-scopes to the VK worktree the agent was launched from. Full tool
+  surface. Gracefully falls back to Global-equivalent behaviour when the CWD
+  doesn't match a VK worktree.
+  </Card>
+  <Card title="Global" icon="globe">
+  No CWD auto-scope. Every tool is available. Use for admin scripts or
+  CI where a single agent works across arbitrary workspaces.
+  </Card>
+  <Card title="Orchestrator" icon="robot">
+  VK-internal only. A lean 14-tool surface pinned to one parent task.
+  Not user-facing.
+  </Card>
+</CardGroup>
+
+Starting with this release, fresh installs default to Workspace mode.
+See [MCP Modes Reference](/integrations/mcp-modes) for the full
+comparison, including which tools each mode exposes.
+
 <Note>
 This page covers connecting **external MCP clients** to Vibe Kanban's MCP server. For configuring MCP servers **within** Vibe Kanban for your coding agents, see the [MCP Server Configuration](/integrations/mcp-server-configuration) guide.
 </Note>
@@ -44,7 +66,7 @@ Add the following configuration to your agent's MCP servers configuration:
   "mcpServers": {
     "vibe_kanban": {
       "command": "npx",
-      "args": ["-y", "vibe-kanban@latest", "--mcp"]
+      "args": ["-y", "vibe-kanban@latest", "--mcp", "--mode", "workspace"]
     }
   }
 }
@@ -273,3 +295,22 @@ Once configured, you'll see the Vibe Kanban MCP server listed and ready to use i
 <Note>
 Similar configuration steps apply to other MCP clients like Claude Desktop, VS Code with MCP extensions, or any custom MCP client implementations.
 </Note>
+
+## Upgrading from older configs
+
+Existing `~/.claude.json` (or equivalent) entries fall into two shapes:
+
+1. **Implicit args** — `["-y", "vibe-kanban@latest", "--mcp"]`.
+   After this release, the next launch automatically picks up
+   Workspace mode. No file edit required.
+2. **Explicit `--mode global`** — your choice is respected and you
+   stay on Global. To switch, replace `global` with `workspace`:
+
+   ```json
+   "args": ["-y", "vibe-kanban@latest", "--mcp", "--mode", "workspace"]
+   ```
+
+Workspace mode is a strict superset of Global. Inside a VK worktree,
+mutations on workspaces outside your current scope are rejected (a
+safety feature — the error message points back to `--mode global` if
+you genuinely need cross-workspace admin).

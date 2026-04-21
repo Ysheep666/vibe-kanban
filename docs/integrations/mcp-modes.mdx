@@ -1,0 +1,121 @@
+---
+title: "MCP Modes Reference"
+description: "Compare Vibe Kanban's MCP launch modes — Workspace, Global, and Orchestrator — and learn when to use each."
+---
+
+Vibe Kanban's MCP server supports three launch modes. Each mode controls
+how the server scopes its tool surface and how it behaves when an agent
+launches from inside a VK worktree. Fresh installs default to
+**Workspace** mode.
+
+## Choosing a mode
+
+<CardGroup cols={3}>
+  <Card title="Workspace (default)" icon="folder-open">
+  Auto-scopes to the VK worktree the agent was launched from. Full tool
+  surface. Gracefully falls back to Global-equivalent behaviour when the
+  CWD doesn't match a VK worktree.
+  </Card>
+  <Card title="Global" icon="globe">
+  No CWD auto-scope. Every tool is available. Use for admin scripts or
+  CI where a single agent works across arbitrary workspaces.
+  </Card>
+  <Card title="Orchestrator" icon="robot">
+  VK-internal only. A lean 14-tool surface pinned to one parent task.
+  Not user-facing.
+  </Card>
+</CardGroup>
+
+## Launching each mode
+
+Pass `--mode <name>` through to the `vibe-kanban-mcp` binary after
+`--mcp`:
+
+```json
+{
+  "mcpServers": {
+    "vibe_kanban": {
+      "command": "npx",
+      "args": ["-y", "vibe-kanban@latest", "--mcp", "--mode", "workspace"]
+    }
+  }
+}
+```
+
+Omitting `--mode` entirely uses the Workspace default.
+
+## Mode comparison
+
+| Behaviour | Workspace | Global | Orchestrator |
+|-----------|-----------|--------|--------------|
+| CWD auto-scope to a VK worktree | Yes | No | Pinned to parent task |
+| Cross-workspace mutations allowed | Rejected with a pointer to `--mode global` | Yes | No |
+| Tool surface | Full (Global superset) | Full | Lean 14-tool surface |
+| Intended caller | Coding agents launched inside VK worktrees | Admin scripts, CI, external MCP clients | VK-internal orchestration only |
+| User-facing | Yes | Yes | No |
+
+Workspace is a strict superset of Global in terms of tools exposed —
+the only difference is the scope guard on mutations. If a mutation
+targets a workspace outside the current scope, Workspace mode rejects
+it with an error message that points back to `--mode global` when
+cross-workspace admin is genuinely required.
+
+## Tool surface by mode
+
+### Workspace and Global
+
+Workspace and Global expose the same tool routers. Both surfaces
+include:
+
+- **Context** — `get_context`
+- **Workspaces** — `list_workspaces`, `update_workspace`,
+  `delete_workspace`, `link_workspace_issue`
+- **Workspace sessions** — `start_workspace`, `create_session`,
+  `list_sessions`, `run_session_prompt`, `get_execution`
+- **Organisations** — `list_organizations`, `list_org_members`
+- **Projects** — `list_projects`
+- **Repositories** — `list_repos`, `get_repo`, `update_setup_script`,
+  `update_cleanup_script`, `update_dev_server_script`
+- **Issues** — `list_issues`, `create_issue`, `get_issue`,
+  `update_issue`, `delete_issue`, `list_issue_priorities`
+- **Issue assignees** — `list_issue_assignees`, `assign_issue`,
+  `unassign_issue`
+- **Issue tags** — `list_tags`, `list_issue_tags`, `add_issue_tag`,
+  `remove_issue_tag`
+- **Issue relationships** — `create_issue_relationship`,
+  `delete_issue_relationship`
+
+The difference is behavioural: Workspace mode's mutations refuse to
+target workspaces outside the current scope. See the full tool list and
+parameters in the
+[Vibe Kanban MCP Server](/integrations/vibe-kanban-mcp-server)
+reference.
+
+### Orchestrator
+
+Orchestrator is a lean 14-tool surface pinned to a single parent task.
+It exposes context, a scoped subset of workspace tools (excluding
+`list_workspaces` and `delete_workspace`), the session tools, and the
+orchestrator-only task tools. It is only launched by VK itself — end
+users do not configure this mode.
+
+## When to pick Global over Workspace
+
+Choose Global when:
+
+- You run admin scripts that touch multiple workspaces in one session.
+- You drive CI jobs that need to create, list, or clean up workspaces
+  across the whole organisation.
+- You connect an external MCP client (Claude Desktop, Raycast) that is
+  not launched from inside a VK worktree.
+
+In every other case — especially coding agents launched inside a VK
+worktree — stick with Workspace mode. The scope guard is there to stop
+an agent from accidentally mutating an unrelated workspace.
+
+## See also
+
+- [Vibe Kanban MCP Server](/integrations/vibe-kanban-mcp-server) — full
+  tool reference and external-client setup.
+- [Connecting MCP Servers](/integrations/mcp-server-configuration) —
+  configuring MCP servers within Vibe Kanban for your coding agents.

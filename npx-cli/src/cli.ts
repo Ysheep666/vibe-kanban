@@ -119,8 +119,8 @@ function showProgress(downloaded: number, total: number): void {
   );
 }
 
-function buildMcpArgs(args: string[]): string[] {
-  return args.length > 0 ? args : ["--mode", "global"];
+export function buildMcpArgs(args: string[]): string[] {
+  return args.length > 0 ? args : ["--mode", "workspace"];
 }
 
 async function extractAndRun(
