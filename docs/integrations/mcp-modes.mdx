@@ -26,23 +26,24 @@ launches from inside a VK worktree. Fresh installs default to
   </Card>
 </CardGroup>
 
-## Launching each mode
+## Launch args
 
-Pass `--mode <name>` through to the `vibe-kanban-mcp` binary after
-`--mcp`:
+<Tabs>
+  <Tab title="Workspace (default)">
+  ```json
+  "args": ["-y", "vibe-kanban@latest", "--mcp", "--mode", "workspace"]
+  ```
+  </Tab>
+  <Tab title="Global">
+  ```json
+  "args": ["-y", "vibe-kanban@latest", "--mcp", "--mode", "global"]
+  ```
+  </Tab>
+</Tabs>
 
-```json
-{
-  "mcpServers": {
-    "vibe_kanban": {
-      "command": "npx",
-      "args": ["-y", "vibe-kanban@latest", "--mcp", "--mode", "workspace"]
-    }
-  }
-}
-```
-
-Omitting `--mode` entirely uses the Workspace default.
+Orchestrator mode is not a user-facing launch option; VK's executor
+framework uses it internally. Omitting `--mode` entirely uses the
+Workspace default.
 
 ## Mode comparison
 
@@ -59,6 +60,43 @@ the only difference is the scope guard on mutations. If a mutation
 targets a workspace outside the current scope, Workspace mode rejects
 it with an error message that points back to `--mode global` when
 cross-workspace admin is genuinely required.
+
+## Scope protection semantics
+
+In Workspace mode (and Orchestrator), the MCP server tracks a *scoped
+workspace ID* derived from the agent's current working directory.
+
+- **Read tools** (`list_*`, `get_*`) never perform scope checks — an
+  agent must be able to discover resources before operating on them.
+- **Mutations that name a workspace ID** (for example
+  `update_workspace`, `start_workspace`,
+  `create_task(parent_workspace_id=...)`) are rejected unless the
+  target is the scoped workspace or a descendant of it via the task
+  parent-chain.
+- **Mutations with implicit workspace** (session and repo-script
+  tools) inherit scope from the resource they act on.
+
+If the agent's CWD doesn't match any VK worktree, Workspace mode
+disables the scope check for that session — behaviour equivalent to
+Global.
+
+## When does scope protection kick in?
+
+```
+AI calls a mutation with workspace_id = X
+│
+├─ Mode is Global? ──── allow (no scope)
+│
+├─ Mode is Workspace/Orchestrator ┐
+│                                 │
+│                    scoped_workspace_id is None? ─── allow (graceful fallback)
+│                                 │
+│                    X == scope? ─── allow (self)
+│                                 │
+│                    X's task.parent_workspace_id == scope? ─── allow (child)
+│                                 │
+│                                 └── reject with error_kind="scope_denied"
+```
 
 ## Tool surface by mode
 
