@@ -11,7 +11,7 @@ use rmcp::{
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::{McpServer, ToolError};
+use super::{McpServer, ToolError, check_scope_allows_workspace};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 struct McpWorkspaceRepoInput {
@@ -297,7 +297,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Link an existing workspace to a remote issue. This associates the workspace with the issue for tracking."
+        description = "Link an existing workspace to a remote issue. In Workspace or Orchestrator mode, the target `workspace_id` must be the scoped workspace or a descendant via the task parent-chain — otherwise the tool rejects with error_kind=\"scope_denied\". Cross-workspace linking requires --mode global."
     )]
     async fn link_workspace_issue(
         &self,
@@ -306,6 +306,15 @@ impl McpServer {
             issue_id,
         }): Parameters<LinkWorkspaceIssueRequest>,
     ) -> Result<CallToolResult, ErrorData> {
+        // Scope guard — keep `link_workspace_issue` in lock-step with
+        // `update_workspace` / `delete_workspace`: a Workspace-mode agent
+        // must not be able to attach an arbitrary other workspace to a
+        // remote issue. Short-circuits before any HTTP round-trip.
+        let mut scope_cache = std::collections::HashMap::new();
+        if !check_scope_allows_workspace(self, &mut scope_cache, workspace_id).await {
+            return Ok(Self::tool_error(self.scope_denied_error(workspace_id)));
+        }
+
         if let Err(e) = self.link_workspace_to_issue(workspace_id, issue_id).await {
             return Ok(Self::tool_error(e));
         }
@@ -315,5 +324,129 @@ impl McpServer {
             workspace_id: workspace_id.to_string(),
             issue_id: issue_id.to_string(),
         })
+    }
+}
+
+// --------------------------------------------------------------------------
+// Tests
+// --------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Once;
+
+    use httpmock::MockServer;
+    use rmcp::handler::server::wrapper::Parameters;
+
+    use super::*;
+
+    static RUSTLS_PROVIDER: Once = Once::new();
+
+    fn install_rustls() {
+        RUSTLS_PROVIDER.call_once(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+    }
+
+    /// Decode a tool-error `CallToolResult` body to JSON so `error_kind` can be
+    /// asserted directly. Mirrors the helper in `tasks.rs` / `remote_tags.rs`.
+    fn error_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
+        assert!(
+            result.is_error.unwrap_or(false),
+            "expected tool error, got success: {result:?}"
+        );
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        };
+        serde_json::from_str(&text).expect("tool error body must be JSON")
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_link_workspace_issue_rejects_unrelated_workspace() {
+        install_rustls();
+        let mock = MockServer::start();
+        let scope = Uuid::new_v4();
+        let unrelated = Uuid::new_v4();
+        let unrelated_task_id = Uuid::new_v4();
+        let other_parent = Uuid::new_v4();
+        let issue_id = Uuid::new_v4();
+
+        // Scope check climbs the chain: fetch the target workspace, then its
+        // task row, and discovers the task's parent workspace is not the
+        // scoped one — deny.
+        mock.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/api/workspaces/{unrelated}"));
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": {
+                    "id": unrelated.to_string(),
+                    "task_id": unrelated_task_id.to_string(),
+                    "container_ref": null,
+                    "branch": "main",
+                    "setup_completed_at": null,
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z",
+                    "archived": false,
+                    "pinned": false,
+                    "name": null,
+                    "worktree_deleted": false,
+                }
+            }));
+        });
+        mock.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/api/tasks/{unrelated_task_id}"));
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": {
+                    "id": unrelated_task_id.to_string(),
+                    "project_id": Uuid::new_v4().to_string(),
+                    "title": "t",
+                    "description": null,
+                    "status": "todo",
+                    "parent_workspace_id": other_parent.to_string(),
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z",
+                }
+            }));
+        });
+        // The issue lookup AND the link mutation must never fire when scope
+        // denies — catch-all them with 500 so a regression surfaces loudly.
+        let issue_guard = mock.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/api/remote/issues/{issue_id}"));
+            then.status(500);
+        });
+        let link_guard = mock.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path(format!("/api/workspaces/{unrelated}/links"));
+            then.status(500);
+        });
+
+        let server = McpServer::new_workspace(&mock.base_url()).with_scope_for_test(scope);
+        let req = LinkWorkspaceIssueRequest {
+            workspace_id: unrelated,
+            issue_id,
+        };
+        let result = server.link_workspace_issue(Parameters(req)).await.unwrap();
+
+        let body = error_json(&result);
+        assert_eq!(
+            body.get("error_kind").and_then(|v| v.as_str()),
+            Some("scope_denied"),
+            "expected scope_denied: {body}"
+        );
+        assert_eq!(
+            issue_guard.hits(),
+            0,
+            "GET /api/remote/issues/{{id}} must not fire when scope denies",
+        );
+        assert_eq!(
+            link_guard.hits(),
+            0,
+            "POST /api/workspaces/{{id}}/links must not fire when scope denies",
+        );
     }
 }
