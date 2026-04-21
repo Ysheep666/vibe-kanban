@@ -281,10 +281,21 @@ impl McpServer {
     }
 
     pub fn workspace_mode_router() -> rmcp::handler::server::tool::ToolRouter<Self> {
-        // Workspace = Global superset. Scope protection lives inside each
-        // mutation tool, gated by McpMode, so the router itself is identical
-        // to Global's.
-        Self::global_mode_router()
+        // Workspace = Global superset + task orchestration. Scope protection
+        // lives inside each mutation tool, gated by `McpMode`, so the router
+        // adds `tasks_tools_router` (create_task, create_and_start_task,
+        // list_tasks, get_task, update_task_status, delete_task) on top of
+        // the Global surface. That lets a coding agent launched inside a VK
+        // worktree spawn and drive child tasks without having to opt into
+        // the lean Orchestrator mode (which is VK-internal).
+        //
+        // The scope guards inside `tasks.rs` (see `resolve_parent_workspace_id`,
+        // `enforce_parent_scope`, `require_parent_in_scope`) already treat
+        // `McpMode::Workspace` the same as `McpMode::Orchestrator`, so the
+        // behaviour here is: auto-default `parent_workspace_id` to the
+        // scoped workspace when omitted, and reject explicit parents that
+        // fall outside the current scope or its child chain.
+        Self::global_mode_router() + Self::tasks_tools_router()
     }
 
     pub fn orchestrator_mode_router() -> rmcp::handler::server::tool::ToolRouter<Self> {
@@ -750,6 +761,53 @@ mod tests {
             "workspace mode must include every global tool; missing: {:?}",
             global.difference(&workspace).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn workspace_mode_exposes_task_orchestration_tools() {
+        // A coding agent launched inside a VK worktree needs the full
+        // task-orchestration surface so it can spawn and drive child tasks
+        // from the scoped workspace. These tools are scope-guarded via
+        // `resolve_parent_workspace_id` / `enforce_parent_scope` /
+        // `require_parent_in_scope` in `tasks.rs`, so exposing them in
+        // Workspace mode is safe.
+        let workspace = tool_names(McpServer::workspace_mode_router());
+        for expected in [
+            "create_task",
+            "create_and_start_task",
+            "list_tasks",
+            "get_task",
+            "update_task_status",
+            "delete_task",
+        ] {
+            assert!(
+                workspace.contains(expected),
+                "missing {expected} in workspace router"
+            );
+        }
+    }
+
+    #[test]
+    fn global_mode_does_not_expose_task_orchestration_tools() {
+        // Task orchestration is Workspace/Orchestrator-only. Global mode is
+        // for admin scripts, CI jobs, and external MCP clients that operate
+        // across workspaces — giving them `create_task` with no scoped
+        // workspace to default `parent_workspace_id` to would be a footgun
+        // (every created task would end up top-level).
+        let global = tool_names(McpServer::global_mode_router());
+        for forbidden in [
+            "create_task",
+            "create_and_start_task",
+            "list_tasks",
+            "get_task",
+            "update_task_status",
+            "delete_task",
+        ] {
+            assert!(
+                !global.contains(forbidden),
+                "{forbidden} must not be exposed in global router"
+            );
+        }
     }
 
     #[test]
