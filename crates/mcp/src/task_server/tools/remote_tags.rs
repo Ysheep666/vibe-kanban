@@ -140,13 +140,16 @@ impl McpServer {
             && let Some(scoped_project) = ctx.project_id
             && scoped_project != project_id
         {
-            return Ok(Self::tool_error(ToolError::new(
-                "Cannot create tag outside the current workspace's project",
-                Some(format!(
-                    "requested project_id={}, scoped project_id={}",
-                    project_id, scoped_project
-                )),
-            )));
+            return Ok(Self::tool_error(
+                ToolError::new(
+                    "Cannot create tag outside the current workspace's project",
+                    Some(format!(
+                        "requested project_id={}, scoped project_id={}",
+                        project_id, scoped_project
+                    )),
+                )
+                .with_error_kind("scope_denied"),
+            ));
         }
 
         let color = color.unwrap_or_else(|| DEFAULT_TAG_COLOR.to_string());
@@ -265,12 +268,13 @@ impl McpServer {
         let tag: Tag = self.send_json(self.client.get(&url)).await?;
         if tag.project_id != scoped_project {
             return Err(ToolError::new(
-                format!("Cannot {verb} tag outside the current workspace's project",),
+                format!("Cannot {verb} tag outside the current workspace's project"),
                 Some(format!(
                     "tag project_id={}, scoped project_id={}",
                     tag.project_id, scoped_project
                 )),
-            ));
+            )
+            .with_error_kind("scope_denied"));
         }
         Ok(())
     }
@@ -370,6 +374,16 @@ mod tests {
         mock.assert_hits(1);
     }
 
+    /// Pull the JSON text out of an `is_error` tool result and parse it
+    /// so individual tests can assert `error_kind`, `error_data`, etc.
+    fn error_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        };
+        serde_json::from_str(&text).expect("error body must be JSON")
+    }
+
     #[tokio::test]
     async fn create_tag_rejects_cross_project_when_scoped() {
         install_rustls();
@@ -399,6 +413,9 @@ mod tests {
             .await
             .expect("must return error tool result");
         assert!(result.is_error.unwrap_or(false));
+        // Must carry the machine-readable kind so AI callers can branch on it
+        // (same contract as workspace-ID scope_denied errors).
+        assert_eq!(error_json(&result)["error_kind"], "scope_denied");
         assert_eq!(backend.hits(), 0);
     }
 
@@ -469,6 +486,7 @@ mod tests {
             .await
             .expect("must return error tool result");
         assert!(result.is_error.unwrap_or(false));
+        assert_eq!(error_json(&result)["error_kind"], "scope_denied");
         lookup.assert_hits(1);
         assert_eq!(mutation.hits(), 0);
     }
@@ -584,6 +602,7 @@ mod tests {
             .await
             .expect("must return error tool result");
         assert!(result.is_error.unwrap_or(false));
+        assert_eq!(error_json(&result)["error_kind"], "scope_denied");
         lookup.assert_hits(1);
         assert_eq!(mutation.hits(), 0);
     }

@@ -69,10 +69,11 @@ workspace ID* derived from the agent's current working directory.
 - **Read tools** (`list_*`, `get_*`) never perform scope checks — an
   agent must be able to discover resources before operating on them.
 - **Mutations that name a workspace ID** (for example
-  `update_workspace`, `start_workspace`,
-  `create_task(parent_workspace_id=...)`) are rejected unless the
-  target is the scoped workspace or a descendant of it via the task
-  parent-chain.
+  `update_workspace`, `delete_workspace`,
+  `link_workspace_issue`) are rejected unless the target is the
+  scoped workspace or a descendant of it via the task parent-chain.
+  (`create_task` is Orchestrator-only and is not exposed in
+  Workspace or Global mode.)
 - **Mutations with implicit workspace** (session and repo-script
   tools) inherit scope from the resource they act on.
 

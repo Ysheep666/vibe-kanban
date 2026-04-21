@@ -129,6 +129,9 @@ For `update_issue`, the `parent_issue_id` field supports three states: omit it e
 | Tool | Purpose | Required Parameters | Optional Parameters | Returns |
 |------|---------|-------------------|-------------------|---------|
 | `list_tags` | List tags for a project | None | `project_id` | List of tags with IDs, names, and colours |
+| `create_tag` | Create a project-scoped tag | `name` | `project_id`<br/>`color` | Created tag (ID, name, colour) |
+| `update_tag` | Update a tag's name and/or colour | `tag_id` | `name`<br/>`color` | Updated tag details |
+| `delete_tag` | Delete a tag; pass `force=true` to cascade when references block the delete | `tag_id` | `force` | Deletion confirmation |
 | `list_issue_tags` | List tags attached to an issue | `issue_id` | None | List of issue-tag relations |
 | `add_issue_tag` | Attach a tag to an issue | `issue_id`<br/>`tag_id` | None | Issue-tag relation ID |
 | `remove_issue_tag` | Remove a tag from an issue | `issue_tag_id` | None | Removal confirmation |
@@ -146,8 +149,10 @@ Supported relationship types: `blocking`, `related`, `has_duplicate`.
 
 | Tool | Purpose | Required Parameters | Optional Parameters | Returns |
 |------|---------|-------------------|-------------------|---------|
-| `list_repos` | List all repositories | None | None | List of repositories with IDs and names |
+| `list_repos` | List all repositories, including local path and display name | None | None | List of repositories with IDs, names, paths, and display names |
 | `get_repo` | Get repository details including scripts | `repo_id` | None | Repository info with setup, cleanup, and dev server scripts |
+| `add_repo` | Register a repository from a local path | `path` | `display_name` | Created repository details |
+| `delete_repo` | Delete a repository; pass `force=true` to cascade when workspaces still reference it | `repo_id` | `force` | Deletion confirmation |
 | `update_setup_script` | Update a repository's setup script | `repo_id`<br/>`script` | None | Update confirmation |
 | `update_cleanup_script` | Update a repository's cleanup script | `repo_id`<br/>`script` | None | Update confirmation |
 | `update_dev_server_script` | Update a repository's dev server script | `repo_id`<br/>`script` | None | Update confirmation |
