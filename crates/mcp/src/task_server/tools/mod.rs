@@ -281,7 +281,7 @@ impl McpServer {
     pub fn workspace_mode_router() -> rmcp::handler::server::tool::ToolRouter<Self> {
         // Workspace = Global superset. Scope protection lives inside each
         // mutation tool, gated by McpMode, so the router itself is identical
-        // to Global's until Task 5 registers the new repos/tags tools.
+        // to Global's.
         Self::global_mode_router()
     }
 

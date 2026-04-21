@@ -112,6 +112,13 @@ impl ApiClient {
 
     /// Update a tag via `PATCH /api/v1/tags/:id`.
     ///
+    /// Only fields the caller actually supplies are sent — the backend's
+    /// `UpdateTagRequest` uses `#[serde(default, deserialize_with =
+    /// "some_if_present")]`, which calls `T::deserialize` on whatever JSON
+    /// is present. Sending `null` for an omitted field would therefore 400
+    /// the request (`String::deserialize(null)` fails), so we build the
+    /// payload as an object that only includes the provided fields.
+    ///
     /// NOTE: The MCP `update_tag` tool does NOT use this helper. The tool
     /// issues the raw HTTP call via `send_mutation_response` so the server's
     /// full error envelope flows to the AI caller unchanged. This helper is
@@ -124,10 +131,20 @@ impl ApiClient {
         color: Option<&str>,
     ) -> ApiResult<Tag> {
         let url = format!("{}/api/v1/tags/{tag_id}", self.base_url);
-        let body = serde_json::json!({
-            "name": name,
-            "color": color,
-        });
+        let mut payload = serde_json::Map::new();
+        if let Some(name) = name {
+            payload.insert(
+                "name".to_string(),
+                serde_json::Value::String(name.to_string()),
+            );
+        }
+        if let Some(color) = color {
+            payload.insert(
+                "color".to_string(),
+                serde_json::Value::String(color.to_string()),
+            );
+        }
+        let body = serde_json::Value::Object(payload);
         let resp = self.client.patch(url).json(&body).send().await?;
         let envelope: MutationResponse<Tag> = resp.json().await?;
         Ok(envelope.data)
@@ -343,6 +360,40 @@ mod api_client_tests {
         });
         let client = ApiClient::new(reqwest::Client::new(), server.base_url());
         client.delete_tag(tid, true).await.expect("must succeed");
+        mock.assert_hits(1);
+    }
+
+    // Regression guard: the backend's `UpdateTagRequest` uses
+    // `some_if_present`, which calls `String::deserialize` on whatever JSON
+    // is present — so an omitted field must be absent, not `null`. A prior
+    // implementation built the payload with `serde_json::json!({"name": name,
+    // "color": color})`, which serializes `Option::None` as JSON `null` and
+    // would 400 the server. This test locks the correct shape in.
+    #[tokio::test]
+    async fn update_tag_omits_absent_fields() {
+        let server = httpmock::MockServer::start();
+        let tid = uuid::Uuid::new_v4();
+        let pid = uuid::Uuid::new_v4();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::PATCH)
+                .path(format!("/api/v1/tags/{tid}"))
+                .json_body(serde_json::json!({ "color": "#FF0000" }));
+            then.status(200).json_body(serde_json::json!({
+                "data": {
+                    "id": tid.to_string(),
+                    "project_id": pid.to_string(),
+                    "name": "bug",
+                    "color": "#FF0000"
+                },
+                "txid": 0
+            }));
+        });
+        let client = ApiClient::new(reqwest::Client::new(), server.base_url());
+        let tag = client
+            .update_tag(tid, None, Some("#FF0000"))
+            .await
+            .expect("must succeed");
+        assert_eq!(tag.color, "#FF0000");
         mock.assert_hits(1);
     }
 }
