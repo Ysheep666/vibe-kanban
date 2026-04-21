@@ -9,16 +9,19 @@ Vibe Kanban exposes a local MCP (Model Context Protocol) server, allowing you to
 
 <CardGroup cols={3}>
   <Card title="Workspace (default)" icon="folder-open">
-  Auto-scopes to the VK worktree the agent was launched from. Full tool
-  surface. Gracefully falls back to Global-equivalent behaviour when the CWD
-  doesn't match a VK worktree.
+  Auto-scopes to the VK worktree the agent was launched from. Exposes
+  the full Global surface plus task orchestration (`create_task` and
+  friends). Cross-scope mutations are rejected with
+  `error_kind="scope_denied"`. Gracefully falls back to
+  Global-equivalent behaviour when the CWD doesn't match a VK worktree.
   </Card>
   <Card title="Global" icon="globe">
-  No CWD auto-scope. Every tool is available. Use for admin scripts or
-  CI where a single agent works across arbitrary workspaces.
+  No CWD auto-scope. Every admin tool is available, but task
+  orchestration tools are intentionally omitted (no ambient scope to
+  default `parent_workspace_id` to). Use for admin scripts or CI.
   </Card>
   <Card title="Orchestrator" icon="robot">
-  VK-internal only. A lean 14-tool surface pinned to one parent task.
+  VK-internal only. A lean tool surface pinned to one parent task.
   Not user-facing.
   </Card>
 </CardGroup>
@@ -157,6 +160,10 @@ Supported relationship types: `blocking`, `related`, `has_duplicate`.
 | `update_cleanup_script` | Update a repository's cleanup script | `repo_id`<br/>`script` | None | Update confirmation |
 | `update_dev_server_script` | Update a repository's dev server script | `repo_id`<br/>`script` | None | Update confirmation |
 
+<Note>
+In Workspace and Orchestrator modes, `delete_repo`, `update_setup_script`, `update_cleanup_script`, and `update_dev_server_script` reject with `error_kind="scope_denied"` when the target `repo_id` is not part of the scoped workspace's repo set. Cross-workspace repo admin requires `--mode global`. `add_repo` is not scope-guarded — it registers a new row and doesn't mutate any existing workspace.
+</Note>
+
 ### Workspace Management
 
 | Tool | Purpose | Required Parameters | Optional Parameters | Returns |
@@ -173,14 +180,39 @@ Supported relationship types: `blocking`, `related`, `has_duplicate`.
 | `start_workspace` | Create a workspace and start its first coding-agent session | `name`<br/>`executor`<br/>`repositories` | `prompt`<br/>`variant`<br/>`issue_id` | Workspace ID |
 | `create_session` | Create a session in an existing workspace | None | `workspace_id`<br/>`executor` | Session summary |
 | `list_sessions` | List sessions for a workspace | None | `workspace_id` | Session list |
+| `update_session` | Update a session's display name (pass an empty string to clear it) | `session_id` | `name` | Updated session summary |
 | `run_session_prompt` | Run a coding-agent prompt inside an existing session | `session_id`<br/>`prompt` | None | Execution details |
 | `get_execution` | Inspect execution status and final message | `execution_id` | None | Execution details |
+| `read_session_messages` | Read normalised conversation messages for a session | None | `workspace_id`<br/>`session_id`<br/>`last_n`<br/>`from_index`<br/>`include_thinking` | Paginated messages with `final_assistant_message` |
 
 The `repositories` parameter is an array of objects with:
 - `repo_id`: The repository ID (UUID)
 - `branch`: The branch for this repository
 
 When `issue_id` is provided, the workspace is automatically linked to the remote issue. If `prompt` is omitted, the linked issue's title and description are used as the workspace prompt.
+
+<Tip>
+`read_session_messages` defaults `last_n` to 20 (server max 200) and resolves `session_id` to the most recently used session in the workspace when omitted. Set `from_index` (0-based) for explicit paging, or `include_thinking=true` to surface reasoning entries.
+</Tip>
+
+### Task Management
+
+Task tools let a coding agent spawn child tasks and drive a parent-task graph from inside a workspace. They're exposed in **Workspace** and **Orchestrator** modes, and deliberately omitted from **Global** mode (Global has no ambient scope, so there's no safe default for `parent_workspace_id`).
+
+| Tool | Purpose | Required Parameters | Optional Parameters | Returns |
+|------|---------|-------------------|-------------------|---------|
+| `create_task` | Create a task row without starting a workspace | `title` | `project_id`<br/>`description`<br/>`parent_workspace_id` | Created task summary |
+| `create_and_start_task` | Atomically create a task, workspace, and first session | `title`<br/>`repositories`<br/>`executor`<br/>`prompt` | `project_id`<br/>`description`<br/>`parent_workspace_id`<br/>`workspace_name`<br/>`variant` | Task + workspace + session IDs |
+| `list_tasks` | List tasks filtered by parent workspace | None | `parent_workspace_id` | List of task summaries |
+| `get_task` | Fetch a single task by ID | `task_id` | None | Task summary |
+| `update_task_status` | Update a task's status | `task_id`<br/>`status` | None | Updated task summary |
+| `delete_task` | Delete a task (linked workspaces have their `task_id` cleared, not cascade-deleted) | `task_id` | None | Deletion confirmation |
+
+Allowed status values: `todo`, `inprogress`, `inreview`, `done`, `cancelled`.
+
+<Note>
+In Workspace and Orchestrator modes, `parent_workspace_id` defaults to the scoped workspace when omitted. Passing an explicit parent that falls outside the scoped workspace or its descendant chain is rejected with `error_kind="scope_denied"`. In Global mode, `parent_workspace_id` is required on `list_tasks` and accepted without scope checks on the create tools.
+</Note>
 
 ### Supported Executors
 
@@ -315,7 +347,10 @@ Existing `~/.claude.json` (or equivalent) entries fall into two shapes:
    "args": ["-y", "vibe-kanban@latest", "--mcp", "--mode", "workspace"]
    ```
 
-Workspace mode is a strict superset of Global. Inside a VK worktree,
-mutations on workspaces outside your current scope are rejected (a
-safety feature — the error message points back to `--mode global` if
-you genuinely need cross-workspace admin).
+Workspace mode covers everything Global exposes plus a task-orchestration
+surface (`create_task`, `create_and_start_task`, `list_tasks`, `get_task`,
+`update_task_status`, `delete_task`) that Global intentionally omits.
+Inside a VK worktree, mutations on workspaces, repos, or tasks outside
+your current scope are rejected with `error_kind="scope_denied"` — a
+safety feature. The error message points back to `--mode global` if you
+genuinely need cross-workspace admin.

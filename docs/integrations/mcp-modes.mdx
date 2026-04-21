@@ -12,16 +12,21 @@ launches from inside a VK worktree. Fresh installs default to
 
 <CardGroup cols={3}>
   <Card title="Workspace (default)" icon="folder-open">
-  Auto-scopes to the VK worktree the agent was launched from. Full tool
-  surface. Gracefully falls back to Global-equivalent behaviour when the
-  CWD doesn't match a VK worktree.
+  Auto-scopes to the VK worktree the agent was launched from. Exposes
+  the full Global surface plus task orchestration
+  (`create_task`, `create_and_start_task`, `list_tasks`, `get_task`,
+  `update_task_status`, `delete_task`). Cross-scope mutations are
+  rejected with `error_kind="scope_denied"`. Gracefully falls back
+  to Global-equivalent behaviour when the CWD doesn't match a VK
+  worktree.
   </Card>
   <Card title="Global" icon="globe">
-  No CWD auto-scope. Every tool is available. Use for admin scripts or
-  CI where a single agent works across arbitrary workspaces.
+  No CWD auto-scope. Every admin tool is available, but task
+  orchestration tools are omitted (no ambient scope to default
+  `parent_workspace_id` to). Use for admin scripts or CI.
   </Card>
   <Card title="Orchestrator" icon="robot">
-  VK-internal only. A lean 14-tool surface pinned to one parent task.
+  VK-internal only. A lean tool surface pinned to one parent task.
   Not user-facing.
   </Card>
 </CardGroup>
@@ -51,20 +56,24 @@ Workspace default.
 |-----------|-----------|--------|--------------|
 | CWD auto-scope to a VK worktree | Yes | No | Pinned to parent task |
 | Cross-workspace mutations allowed | Rejected with a pointer to `--mode global` | Yes | No |
-| Tool surface | Full (Global superset) | Full | Lean 14-tool surface |
+| Cross-repo mutations on scripts | Rejected with `error_kind="scope_denied"` | Yes | Rejected |
+| Tool surface | Global admin tools + task orchestration | Admin tools only (no task orchestration) | Lean orchestrator surface |
+| `create_task` / `create_and_start_task` | Yes | No | Yes |
 | Intended caller | Coding agents launched inside VK worktrees | Admin scripts, CI, external MCP clients | VK-internal orchestration only |
 | User-facing | Yes | Yes | No |
 
-Workspace is a strict superset of Global in terms of tools exposed —
-the only difference is the scope guard on mutations. If a mutation
-targets a workspace outside the current scope, Workspace mode rejects
-it with an error message that points back to `--mode global` when
-cross-workspace admin is genuinely required.
+Workspace adds task orchestration on top of Global's admin surface and
+enforces scope guards on workspace, repo, and task mutations. If a
+mutation targets a workspace, repo, or task outside the current scope,
+Workspace mode rejects it with `error_kind="scope_denied"` and a
+message that points back to `--mode global` when cross-workspace admin
+is genuinely required.
 
 ## Scope protection semantics
 
 In Workspace mode (and Orchestrator), the MCP server tracks a *scoped
-workspace ID* derived from the agent's current working directory.
+workspace ID* derived from the agent's current working directory, plus
+a snapshot of that workspace's repo set.
 
 - **Read tools** (`list_*`, `get_*`) never perform scope checks — an
   agent must be able to discover resources before operating on them.
@@ -72,16 +81,25 @@ workspace ID* derived from the agent's current working directory.
   `update_workspace`, `delete_workspace`,
   `link_workspace_issue`) are rejected unless the target is the
   scoped workspace or a descendant of it via the task parent-chain.
-  (`create_task` is Orchestrator-only and is not exposed in
-  Workspace or Global mode.)
-- **Mutations with implicit workspace** (session and repo-script
-  tools) inherit scope from the resource they act on.
+- **Mutations that name a repo ID** (`delete_repo`,
+  `update_setup_script`, `update_cleanup_script`,
+  `update_dev_server_script`) are rejected unless the repo is part of
+  the scoped workspace's repo set. `add_repo` is not scope-guarded —
+  it registers a new row and does not mutate any existing workspace.
+- **Task orchestration tools** (`create_task`, `create_and_start_task`,
+  `list_tasks`) default `parent_workspace_id` to the scoped workspace
+  when omitted and reject an explicit parent that falls outside the
+  scoped workspace or its descendant chain.
+- **Mutations with implicit workspace** (session tools) inherit scope
+  from the resource they act on.
 
 If the agent's CWD doesn't match any VK worktree, Workspace mode
 disables the scope check for that session — behaviour equivalent to
-Global.
+Global, except the task orchestration tools are still exposed.
 
 ## When does scope protection kick in?
+
+Workspace-level mutations follow the parent-chain check:
 
 ```
 AI calls a mutation with workspace_id = X
@@ -99,18 +117,36 @@ AI calls a mutation with workspace_id = X
 │                                 └── reject with error_kind="scope_denied"
 ```
 
+Repo-level mutations (`delete_repo`, `update_*_script`) use an
+in-memory check against the scoped workspace's repo set:
+
+```
+AI calls a repo mutation with repo_id = R
+│
+├─ Mode is Global? ──── allow (no scope)
+│
+├─ Mode is Workspace/Orchestrator ┐
+│                                 │
+│                    scoped context is None? ─── allow (graceful fallback)
+│                                 │
+│                    R ∈ workspace_repos? ─── allow
+│                                 │
+│                                 └── reject with error_kind="scope_denied"
+```
+
 ## Tool surface by mode
 
-### Workspace and Global
+### Global
 
-Workspace and Global expose the same tool routers. Both surfaces
-include:
+Global is the admin baseline. Every tool below is also exposed in
+Workspace mode; Workspace adds task orchestration on top.
 
 - **Context** — `get_context`
 - **Workspaces** — `list_workspaces`, `update_workspace`,
   `delete_workspace`, `link_workspace_issue`
 - **Workspace sessions** — `start_workspace`, `create_session`,
-  `list_sessions`, `run_session_prompt`, `get_execution`
+  `list_sessions`, `update_session`, `run_session_prompt`,
+  `get_execution`, `read_session_messages`
 - **Organisations** — `list_organizations`, `list_org_members`
 - **Projects** — `list_projects`
 - **Repositories** — `list_repos`, `get_repo`, `add_repo`,
@@ -126,17 +162,25 @@ include:
 - **Issue relationships** — `create_issue_relationship`,
   `delete_issue_relationship`
 
-The difference is behavioural: Workspace mode's mutations refuse to
-target workspaces outside the current scope. See the full tool list and
-parameters in the
+### Workspace
+
+Workspace exposes everything Global does **plus** a task orchestration
+surface:
+
+- **Tasks** — `create_task`, `create_and_start_task`, `list_tasks`,
+  `get_task`, `update_task_status`, `delete_task`
+
+Mutations on workspaces, repos, and tasks are scope-guarded against
+the current VK worktree. Task-tool parameters default to the scoped
+workspace when omitted; see the full tool list and parameters in the
 [Vibe Kanban MCP Server](/integrations/vibe-kanban-mcp-server)
 reference.
 
 ### Orchestrator
 
-Orchestrator pins a lean 14-tool surface to a single parent task. It is
-only launched by VK itself — end users do not configure this mode. The
-full surface:
+Orchestrator pins a lean surface to a single parent task. It is only
+launched by VK itself — end users do not configure this mode. The full
+surface:
 
 - **Context** — `get_context`
 - **Workspaces** — `update_workspace`
@@ -150,15 +194,19 @@ full surface:
 
 Choose Global when:
 
-- You run admin scripts that touch multiple workspaces in one session.
-- You drive CI jobs that need to create, list, or clean up workspaces
+- You run admin scripts that touch multiple workspaces, repos, or
+  scripts in one session.
+- You drive CI jobs that need to create, list, or clean up resources
   across the whole organisation.
 - You connect an external MCP client (Claude Desktop, Raycast) that is
-  not launched from inside a VK worktree.
+  not launched from inside a VK worktree and only needs admin tools,
+  not task orchestration.
 
 In every other case — especially coding agents launched inside a VK
 worktree — stick with Workspace mode. The scope guard is there to stop
-an agent from accidentally mutating an unrelated workspace.
+an agent from accidentally mutating an unrelated workspace or repo,
+and the task orchestration tools are only available in Workspace (or
+Orchestrator) mode.
 
 ## See also
 
