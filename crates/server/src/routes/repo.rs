@@ -381,27 +381,21 @@ pub async fn delete_repo(
 mod delete_repo_query_tests {
     use super::*;
 
-    #[derive(Deserialize)]
-    pub struct ForceDeleteQuery {
-        #[serde(default)]
-        pub force: bool,
-    }
-
     #[test]
     fn force_query_defaults_false_when_missing() {
-        let q: ForceDeleteQuery = serde_urlencoded::from_str("").unwrap();
+        let q: DeleteRepoQuery = serde_urlencoded::from_str("").unwrap();
         assert!(!q.force);
     }
 
     #[test]
     fn force_query_parses_true() {
-        let q: ForceDeleteQuery = serde_urlencoded::from_str("force=true").unwrap();
+        let q: DeleteRepoQuery = serde_urlencoded::from_str("force=true").unwrap();
         assert!(q.force);
     }
 
     #[test]
     fn force_query_parses_false_explicit() {
-        let q: ForceDeleteQuery = serde_urlencoded::from_str("force=false").unwrap();
+        let q: DeleteRepoQuery = serde_urlencoded::from_str("force=false").unwrap();
         assert!(!q.force);
     }
 }
