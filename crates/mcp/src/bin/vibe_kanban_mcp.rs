@@ -15,6 +15,7 @@ const PORT_ENV: &str = "MCP_PORT";
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum McpLaunchMode {
     Global,
+    Workspace,
     Orchestrator,
     /// v4 stdio bridge for Cursor IDE's Composer Agent. **Workspace-
     /// agnostic**: a single bridge serves all Composer chats; the
@@ -59,6 +60,15 @@ fn main() -> anyhow::Result<()> {
                 McpLaunchMode::Global => {
                     let base_url = base_url_or_err?;
                     let server = McpServer::new_global(&base_url);
+                    let service = server.init().await?.serve(stdio()).await.map_err(|error| {
+                        tracing::error!("serving error: {:?}", error);
+                        error
+                    })?;
+                    service.waiting().await?;
+                }
+                McpLaunchMode::Workspace => {
+                    let base_url = base_url_or_err?;
+                    let server = McpServer::new_workspace(&base_url);
                     let service = server.init().await?.serve(stdio()).await.map_err(|error| {
                         tracing::error!("serving error: {:?}", error);
                         error
@@ -132,7 +142,7 @@ where
             "--mode" => {
                 mode_arg = Some(args.next().ok_or_else(|| {
                     anyhow::anyhow!(
-                        "Missing value for --mode. Expected 'global', 'orchestrator', 'cursor-bridge', or 'session-placeholder'"
+                        "Missing value for --mode. Expected 'workspace', 'global', 'orchestrator', 'cursor-bridge', or 'session-placeholder'"
                     )
                 })?);
             }
@@ -161,9 +171,10 @@ where
             "-h" | "--help" => {
                 println!(
                     "Usage:\n  \
-                     vibe-kanban-mcp --mode <global|orchestrator>\n  \
+                     vibe-kanban-mcp --mode <workspace|global|orchestrator>\n  \
                      vibe-kanban-mcp --mode cursor-bridge [--label <text>]\n  \
-                     vibe-kanban-mcp --mode session-placeholder --session-id <UUID>"
+                     vibe-kanban-mcp --mode session-placeholder --session-id <UUID>\n\
+                     \nDefault mode: workspace (scoped to the VK worktree when CWD matches one, else graceful fallback)."
                 );
                 std::process::exit(0);
             }
@@ -177,7 +188,7 @@ where
 
     let mode_str = mode_arg
         .as_deref()
-        .unwrap_or("global")
+        .unwrap_or("workspace")
         .trim()
         .to_ascii_lowercase();
 
@@ -189,6 +200,14 @@ where
                 ));
             }
             McpLaunchMode::Global
+        }
+        "workspace" => {
+            if session_id_arg.is_some() || label_arg.is_some() {
+                return Err(anyhow::anyhow!(
+                    "--session-id / --label are not valid with --mode workspace"
+                ));
+            }
+            McpLaunchMode::Workspace
         }
         "orchestrator" => {
             if session_id_arg.is_some() || label_arg.is_some() {
@@ -223,7 +242,7 @@ where
         }
         value => {
             return Err(anyhow::anyhow!(
-                "Invalid MCP mode '{value}'. Expected 'global', 'orchestrator', 'cursor-bridge', or 'session-placeholder'"
+                "Invalid MCP mode '{value}'. Expected 'workspace', 'global', 'orchestrator', 'cursor-bridge', or 'session-placeholder'"
             ));
         }
     };
@@ -387,5 +406,28 @@ mod tests {
         )
         .expect_err("session-id should be rejected for cursor-bridge");
         assert!(error.to_string().contains("--session-id"));
+    }
+
+    #[test]
+    fn mode_workspace_parses() {
+        let cfg =
+            resolve_launch_config_from_iter(["--mode", "workspace"].iter().map(|s| s.to_string()))
+                .expect("workspace mode must parse");
+        assert_eq!(cfg.mode, McpLaunchMode::Workspace);
+    }
+
+    #[test]
+    fn default_mode_is_workspace() {
+        let cfg = resolve_launch_config_from_iter(std::iter::empty())
+            .expect("empty args must default to workspace");
+        assert_eq!(cfg.mode, McpLaunchMode::Workspace);
+    }
+
+    #[test]
+    fn mode_global_still_explicit_opt_in() {
+        let cfg =
+            resolve_launch_config_from_iter(["--mode", "global"].iter().map(|s| s.to_string()))
+                .expect("global mode must parse");
+        assert_eq!(cfg.mode, McpLaunchMode::Global);
     }
 }

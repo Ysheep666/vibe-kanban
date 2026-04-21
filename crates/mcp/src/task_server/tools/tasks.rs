@@ -171,13 +171,14 @@ impl McpServer {
     }
 
     /// Resolve the `parent_workspace_id` that a task-creating tool should
-    /// use. In orchestrator mode, auto-fill with the scoped workspace when
-    /// the caller didn't supply one. In global mode the caller decides.
+    /// use. In orchestrator/workspace mode, auto-fill with the scoped
+    /// workspace when the caller didn't supply one. In global mode the
+    /// caller decides.
     fn resolve_parent_workspace_id(&self, explicit: Option<Uuid>) -> Option<Uuid> {
         if explicit.is_some() {
             return explicit;
         }
-        if matches!(self.mode(), McpMode::Orchestrator) {
+        if matches!(self.mode(), McpMode::Orchestrator | McpMode::Workspace) {
             return self.scoped_workspace_id();
         }
         None
@@ -196,20 +197,22 @@ impl McpServer {
     }
 
     /// For tools that operate on an existing `Task`, verify the task's
-    /// `parent_workspace_id` lies within the orchestrator scope.
+    /// `parent_workspace_id` lies within the orchestrator/workspace scope.
     ///
-    /// - Non-Orchestrator mode → always allowed.
-    /// - Orchestrator without a `scoped_workspace_id` → allowed (no scope set yet).
-    /// - Orchestrator with scope AND task has no parent → denied (D12 only
-    ///   relaxes for parent→child; top-level tasks stay out-of-scope).
-    /// - Orchestrator with scope AND task has parent →
+    /// - Global mode → always allowed.
+    /// - Orchestrator/Workspace without a `scoped_workspace_id` → allowed
+    ///   (no scope set — Workspace graceful fallback, or Orchestrator init
+    ///   test paths).
+    /// - Orchestrator/Workspace with scope AND task has no parent → denied
+    ///   (D12 only relaxes for parent→child; top-level tasks stay out-of-scope).
+    /// - Orchestrator/Workspace with scope AND task has parent →
     ///   `check_scope_allows_workspace(parent)`.
     async fn require_parent_in_scope(
         &self,
         task: &db::models::task::Task,
         scope_cache: &mut std::collections::HashMap<Uuid, bool>,
     ) -> Result<(), ToolError> {
-        if !matches!(self.mode(), McpMode::Orchestrator) {
+        if matches!(self.mode(), McpMode::Global) {
             return Ok(());
         }
         if self.scoped_workspace_id().is_none() {

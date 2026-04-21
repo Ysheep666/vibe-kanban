@@ -95,14 +95,6 @@ impl McpServer {
         }
     }
 
-    // Temporary alias until Task 2 introduces the real workspace router.
-    // Remove this shim in Task 2 when `workspace_mode_router` is defined
-    // in `tools/mod.rs`.
-    #[doc(hidden)]
-    fn workspace_mode_router() -> rmcp::handler::server::tool::ToolRouter<Self> {
-        Self::global_mode_router()
-    }
-
     pub fn api(&self) -> &api_client::ApiClient {
         &self.api_client
     }

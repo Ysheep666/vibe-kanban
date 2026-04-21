@@ -276,6 +276,13 @@ impl McpServer {
             + Self::session_tools_router()
     }
 
+    pub fn workspace_mode_router() -> rmcp::handler::server::tool::ToolRouter<Self> {
+        // Workspace = Global superset. Scope protection lives inside each
+        // mutation tool, gated by McpMode, so the router itself is identical
+        // to Global's until Task 5 registers the new repos/tags tools.
+        Self::global_mode_router()
+    }
+
     pub fn orchestrator_mode_router() -> rmcp::handler::server::tool::ToolRouter<Self> {
         let mut router = Self::context_tools_router()
             + Self::workspaces_tools_router()
@@ -621,6 +628,17 @@ mod tests {
         assert!(actual.contains("list_workspaces"));
         assert!(actual.contains("delete_workspace"));
         assert!(!actual.contains("output_markdown"));
+    }
+
+    #[test]
+    fn workspace_mode_exposes_global_superset() {
+        let workspace = tool_names(McpServer::workspace_mode_router());
+        let global = tool_names(McpServer::global_mode_router());
+        assert!(
+            global.is_subset(&workspace),
+            "workspace mode must include every global tool; missing: {:?}",
+            global.difference(&workspace).collect::<Vec<_>>()
+        );
     }
 
     #[test]
