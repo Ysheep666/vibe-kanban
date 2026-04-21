@@ -44,6 +44,7 @@ pub struct McpContext {
 #[derive(Debug, Clone)]
 pub enum McpMode {
     Global,
+    Workspace,
     Orchestrator,
 }
 
@@ -80,6 +81,26 @@ impl McpServer {
             context: None,
             mode: McpMode::Orchestrator,
         }
+    }
+
+    pub fn new_workspace(base_url: &str) -> Self {
+        let client = reqwest::Client::new();
+        Self {
+            api_client: api_client::ApiClient::new(client.clone(), base_url),
+            client,
+            base_url: base_url.to_string(),
+            tool_router: Self::workspace_mode_router(),
+            context: None,
+            mode: McpMode::Workspace,
+        }
+    }
+
+    // Temporary alias until Task 2 introduces the real workspace router.
+    // Remove this shim in Task 2 when `workspace_mode_router` is defined
+    // in `tools/mod.rs`.
+    #[doc(hidden)]
+    fn workspace_mode_router() -> rmcp::handler::server::tool::ToolRouter<Self> {
+        Self::global_mode_router()
     }
 
     pub fn api(&self) -> &api_client::ApiClient {
@@ -135,7 +156,9 @@ impl McpServer {
             Ok(Some(ctx)) => Ok(Some(
                 self.build_mcp_context_from_workspace_context(&ctx).await,
             )),
-            Ok(None) | Err(_) if matches!(self.mode(), McpMode::Global) => Ok(None),
+            Ok(None) | Err(_) if matches!(self.mode(), McpMode::Global | McpMode::Workspace) => {
+                Ok(None)
+            }
             Ok(None) => anyhow::bail!(
                 "Failed to load orchestrator MCP context from /api/containers/attempt-context"
             ),
@@ -265,5 +288,54 @@ impl McpServer {
         let api_response: ApiResponseEnvelope<api_types::Project> = response.json().await.ok()?;
         let project = api_response.data?;
         Some(project.organization_id)
+    }
+}
+
+#[cfg(test)]
+mod init_tests {
+    use httpmock::MockServer;
+
+    use super::*;
+
+    fn install_rustls() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_init_is_graceful_when_cwd_unmatched() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        // Backend returns 404 for the attempt-context lookup — mimics
+        // "AI launched outside any VK worktree".
+        mock_server.mock(|when, then| {
+            when.path("/api/containers/attempt-context");
+            then.status(404);
+        });
+
+        let server = McpServer::new_workspace(&mock_server.base_url());
+        let initialized = server.init().await.expect("init must not fail");
+        assert!(initialized.context.is_none());
+        assert!(matches!(initialized.mode(), McpMode::Workspace));
+    }
+
+    #[tokio::test]
+    async fn orchestrator_mode_init_fails_when_cwd_unmatched() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        mock_server.mock(|when, then| {
+            when.path("/api/containers/attempt-context");
+            then.status(404);
+        });
+
+        let server = McpServer::new_orchestrator(&mock_server.base_url());
+        let err = server.init().await.expect_err("init must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Failed to load orchestrator MCP context"),
+            "unexpected error message: {msg}"
+        );
     }
 }

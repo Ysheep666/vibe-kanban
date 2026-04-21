@@ -218,9 +218,12 @@ pub(crate) async fn check_scope_allows_workspace(
     scope_cache: &mut HashMap<Uuid, bool>,
     target: Uuid,
 ) -> bool {
-    if !matches!(server.mode(), McpMode::Orchestrator) {
+    // Global has no scope at all.
+    if matches!(server.mode(), McpMode::Global) {
         return true;
     }
+    // Workspace + Orchestrator: scope check runs, but a missing scope
+    // (Workspace graceful fallback; Orchestrator test paths) is allow-all.
     let scoped = match server.scoped_workspace_id() {
         Some(x) => x,
         None => return true,
@@ -1018,5 +1021,47 @@ mod check_scope_tests {
 
         ws_mock.assert_hits(1);
         task_mock.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_with_none_scope_allows_all() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        // Any backend call would fail the test — assert zero hits.
+        let catch_all = mock_server.mock(|when, then| {
+            when.any_request();
+            then.status(500);
+        });
+
+        let server = McpServer::new_workspace(&mock_server.base_url());
+        // context is None by default; scope check must short-circuit to true.
+        let mut cache = HashMap::new();
+        assert!(check_scope_allows_workspace(&server, &mut cache, Uuid::new_v4()).await);
+        assert_eq!(catch_all.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_rejects_unrelated_when_scoped() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let scope = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let other_parent = Uuid::new_v4();
+
+        mock_server.mock(|when, then| {
+            when.path(format!("/api/workspaces/{child}"));
+            then.status(200)
+                .json_body(ws_envelope(child, Some(task_id)));
+        });
+        mock_server.mock(|when, then| {
+            when.path(format!("/api/tasks/{task_id}"));
+            then.status(200)
+                .json_body(task_envelope(task_id, Some(other_parent)));
+        });
+
+        let server = McpServer::new_workspace(&mock_server.base_url()).with_scope_for_test(scope);
+        let mut cache = HashMap::new();
+        assert!(!check_scope_allows_workspace(&server, &mut cache, child).await);
     }
 }
