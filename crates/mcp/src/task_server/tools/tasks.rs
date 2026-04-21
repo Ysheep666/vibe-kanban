@@ -901,7 +901,7 @@ mod tests {
         };
         let result = server.create_task(Parameters(req)).await.unwrap();
         assert!(
-            result.is_error.unwrap_or(false) == false,
+            !result.is_error.unwrap_or(false),
             "create_task should succeed when parent defaults to scope: {result:?}"
         );
         create_mock.assert_hits(1);
@@ -1033,7 +1033,7 @@ mod tests {
         };
         let result = server.create_and_start_task(Parameters(req)).await.unwrap();
         assert!(
-            result.is_error.unwrap_or(false) == false,
+            !result.is_error.unwrap_or(false),
             "create_and_start_task should succeed when parent defaults to scope: {result:?}"
         );
         start_mock.assert_hits(1);
