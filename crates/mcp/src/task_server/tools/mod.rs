@@ -201,6 +201,49 @@ impl McpServer {
         )
         .with_error_kind("scope_denied")
     }
+
+    /// Repo-level scope guard for Workspace/Orchestrator modes.
+    ///
+    /// `delete_repo` and the `update_*_script` tools mutate a `Repo` row
+    /// that can be shared across many workspaces — and `Repo` itself carries
+    /// no organisation/project/workspace foreign key (it's global in the
+    /// data model). That makes the right scope question "is this repo one
+    /// of the scoped workspace's dependencies?", which we can answer
+    /// synchronously from `context.workspace_repos` — no HTTP lookup, no
+    /// new backend endpoint needed.
+    ///
+    /// Semantics, mirroring the workspace-level guard:
+    /// - Global mode → allow (no scope in effect).
+    /// - Workspace/Orchestrator with no context → allow (graceful fallback
+    ///   — Workspace mode outside a VK worktree, Orchestrator test paths).
+    /// - Repo is in the scoped workspace's `workspace_repos` → allow.
+    /// - Anything else → `scope_denied`.
+    fn require_repo_in_scope(&self, repo_id: Uuid, verb: &str) -> Result<(), ToolError> {
+        if matches!(self.mode(), McpMode::Global) {
+            return Ok(());
+        }
+        let Some(ctx) = &self.context else {
+            return Ok(());
+        };
+        if ctx.workspace_repos.iter().any(|r| r.repo_id == repo_id) {
+            return Ok(());
+        }
+        let scoped: Vec<String> = ctx
+            .workspace_repos
+            .iter()
+            .map(|r| r.repo_id.to_string())
+            .collect();
+        Err(ToolError::new(
+            format!("Cannot {verb} repo outside the current workspace's repo set"),
+            Some(format!(
+                "requested repo_id={}, scoped workspace_id={}, scoped repos=[{}]",
+                repo_id,
+                ctx.workspace_id,
+                scoped.join(", ")
+            )),
+        )
+        .with_error_kind("scope_denied"))
+    }
 }
 
 /// Async, memoised scope check for Workspace and Orchestrator modes.

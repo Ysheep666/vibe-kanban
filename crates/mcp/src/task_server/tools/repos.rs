@@ -170,7 +170,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Update a repository's setup script. The setup script runs when initializing a workspace."
+        description = "Update a repository's setup script. The setup script runs when initializing a workspace. In Workspace or Orchestrator mode the repo must belong to the scoped workspace; otherwise the tool rejects with error_kind=\"scope_denied\"."
     )]
     async fn update_setup_script(
         &self,
@@ -178,6 +178,9 @@ impl McpServer {
             UpdateSetupScriptRequest,
         >,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(error) = self.require_repo_in_scope(repo_id, "update setup_script for") {
+            return Ok(Self::tool_error(error));
+        }
         let url = self.url(&format!("/api/repos/{}", repo_id));
         let script_value = if script.is_empty() {
             None
@@ -199,7 +202,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Update a repository's cleanup script. The cleanup script runs when tearing down a workspace."
+        description = "Update a repository's cleanup script. The cleanup script runs when tearing down a workspace. In Workspace or Orchestrator mode the repo must belong to the scoped workspace; otherwise the tool rejects with error_kind=\"scope_denied\"."
     )]
     async fn update_cleanup_script(
         &self,
@@ -207,6 +210,9 @@ impl McpServer {
             UpdateCleanupScriptRequest,
         >,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(error) = self.require_repo_in_scope(repo_id, "update cleanup_script for") {
+            return Ok(Self::tool_error(error));
+        }
         let url = self.url(&format!("/api/repos/{}", repo_id));
         let script_value = if script.is_empty() {
             None
@@ -228,7 +234,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Update a repository's dev server script. The dev server script starts the development server for the repository."
+        description = "Update a repository's dev server script. The dev server script starts the development server for the repository. In Workspace or Orchestrator mode the repo must belong to the scoped workspace; otherwise the tool rejects with error_kind=\"scope_denied\"."
     )]
     async fn update_dev_server_script(
         &self,
@@ -236,6 +242,9 @@ impl McpServer {
             UpdateDevServerScriptRequest,
         >,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(error) = self.require_repo_in_scope(repo_id, "update dev_server_script for") {
+            return Ok(Self::tool_error(error));
+        }
         let url = self.url(&format!("/api/repos/{}", repo_id));
         let script_value = if script.is_empty() {
             None
@@ -281,12 +290,15 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Delete a repository. When active workspaces reference the repo, rejects with a 409 envelope whose error_data = {message, workspaces: string[]} lists the blocking workspace branches; pass force=true to delete anyway. Future server releases may also set error_kind on that envelope."
+        description = "Delete a repository. When active workspaces reference the repo, rejects with a 409 envelope whose error_data = {message, workspaces: string[]} lists the blocking workspace branches; pass force=true to delete anyway. In Workspace or Orchestrator mode the repo must be part of the scoped workspace's repo set — otherwise the tool rejects with error_kind=\"scope_denied\" and the cross-workspace delete must be retried under --mode global. Future server releases may also set error_kind on the 409 envelope."
     )]
     async fn delete_repo(
         &self,
         Parameters(DeleteRepoRequest { repo_id, force }): Parameters<DeleteRepoRequest>,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(error) = self.require_repo_in_scope(repo_id, "delete") {
+            return Ok(Self::tool_error(error));
+        }
         let url = self.url(&format!("/api/repos/{}", repo_id));
         let mut req = self.client.delete(&url);
         if force.unwrap_or(false) {
@@ -543,5 +555,299 @@ mod tests {
         assert_eq!(v["name"], "vibe-kanban");
         assert_eq!(v["display_name"], "Vibe Kanban");
         assert_eq!(v["path"], "/home/alice/code/vibe-kanban");
+    }
+
+    // ----------------------------------------------------------------------
+    // Repo-level scope guard (C2 — Workspace-mode protection for
+    // `delete_repo` + `update_*_script`).
+    //
+    // `Repo` has no project/workspace foreign key — it's global in the data
+    // model — so the scope check asks "is this repo in the scoped
+    // workspace's repo set?". That set is already in `McpContext`, so the
+    // guard is purely in-memory: a catch-all mock with `status(500)` on the
+    // mutation endpoint verifies the tool short-circuits before touching
+    // HTTP.
+    // ----------------------------------------------------------------------
+
+    /// Decode a `CallToolResult` error body as JSON so `error_kind` can be
+    /// asserted structurally. Mirrors the helper in `remote_tags.rs`.
+    fn error_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
+        assert!(result.is_error.unwrap_or(false), "expected error: {result:?}");
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        serde_json::from_str(&text).expect("tool error body must be JSON")
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_delete_repo_rejects_repo_outside_scope() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        // Any DELETE would be a regression — the guard must short-circuit.
+        let backend_guard = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE);
+            then.status(500);
+        });
+
+        let scope_ws = Uuid::new_v4();
+        let scoped_repo = Uuid::new_v4();
+        let unrelated_repo = Uuid::new_v4();
+
+        let server = McpServer::new_workspace(&mock_server.base_url())
+            .with_scope_and_repos_for_test(scope_ws, vec![scoped_repo]);
+        let req = DeleteRepoRequest {
+            repo_id: unrelated_repo,
+            force: None,
+        };
+        let result = server
+            .delete_repo(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .unwrap();
+
+        let body = error_json(&result);
+        assert_eq!(
+            body.get("error_kind").and_then(|v| v.as_str()),
+            Some("scope_denied"),
+            "expected scope_denied: {body}"
+        );
+        assert_eq!(
+            backend_guard.hits(),
+            0,
+            "DELETE /api/repos/{{id}} must not fire when repo is out of scope",
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_delete_repo_allows_repo_in_scope() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let scope_ws = Uuid::new_v4();
+        let scoped_repo = Uuid::new_v4();
+
+        let delete_mock = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE)
+                .path(format!("/api/repos/{scoped_repo}"));
+            then.status(200).json_body(serde_json::json!({
+                "success": true, "data": null
+            }));
+        });
+
+        let server = McpServer::new_workspace(&mock_server.base_url())
+            .with_scope_and_repos_for_test(scope_ws, vec![scoped_repo]);
+        let req = DeleteRepoRequest {
+            repo_id: scoped_repo,
+            force: None,
+        };
+        let result = server
+            .delete_repo(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error.unwrap_or(false),
+            "in-scope delete should succeed: {result:?}"
+        );
+        delete_mock.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_without_context_allows_delete_repo() {
+        // Graceful fallback: Workspace mode launched from a CWD that doesn't
+        // match a VK worktree has no context → scope check is allow-all,
+        // matching the workspace-level guard semantics documented in
+        // `mcp-modes.mdx`.
+        install_rustls();
+        let mock_server = MockServer::start();
+        let rid = Uuid::new_v4();
+
+        let delete_mock = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE)
+                .path(format!("/api/repos/{rid}"));
+            then.status(200).json_body(serde_json::json!({
+                "success": true, "data": null
+            }));
+        });
+
+        let server = McpServer::new_workspace(&mock_server.base_url());
+        let req = DeleteRepoRequest {
+            repo_id: rid,
+            force: None,
+        };
+        let result = server
+            .delete_repo(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        delete_mock.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn global_mode_does_not_apply_repo_scope_guard() {
+        // Sanity: Global mode has no scope — even the mere presence of the
+        // scope helper in `delete_repo` must never block a Global-mode caller.
+        install_rustls();
+        let mock_server = MockServer::start();
+        let rid = Uuid::new_v4();
+
+        let delete_mock = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE)
+                .path(format!("/api/repos/{rid}"));
+            then.status(200).json_body(serde_json::json!({
+                "success": true, "data": null
+            }));
+        });
+
+        let server = McpServer::new_global(&mock_server.base_url());
+        let req = DeleteRepoRequest {
+            repo_id: rid,
+            force: None,
+        };
+        let result = server
+            .delete_repo(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        delete_mock.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_update_setup_script_rejects_repo_outside_scope() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let backend_guard = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::PUT);
+            then.status(500);
+        });
+
+        let scope_ws = Uuid::new_v4();
+        let scoped_repo = Uuid::new_v4();
+        let unrelated_repo = Uuid::new_v4();
+
+        let server = McpServer::new_workspace(&mock_server.base_url())
+            .with_scope_and_repos_for_test(scope_ws, vec![scoped_repo]);
+        let req = UpdateSetupScriptRequest {
+            repo_id: unrelated_repo,
+            script: "echo hi".to_string(),
+        };
+        let result = server
+            .update_setup_script(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .unwrap();
+
+        let body = error_json(&result);
+        assert_eq!(
+            body.get("error_kind").and_then(|v| v.as_str()),
+            Some("scope_denied"),
+        );
+        assert_eq!(backend_guard.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_update_cleanup_script_rejects_repo_outside_scope() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let backend_guard = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::PUT);
+            then.status(500);
+        });
+
+        let scope_ws = Uuid::new_v4();
+        let scoped_repo = Uuid::new_v4();
+        let unrelated_repo = Uuid::new_v4();
+
+        let server = McpServer::new_workspace(&mock_server.base_url())
+            .with_scope_and_repos_for_test(scope_ws, vec![scoped_repo]);
+        let req = UpdateCleanupScriptRequest {
+            repo_id: unrelated_repo,
+            script: "echo bye".to_string(),
+        };
+        let result = server
+            .update_cleanup_script(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .unwrap();
+
+        let body = error_json(&result);
+        assert_eq!(
+            body.get("error_kind").and_then(|v| v.as_str()),
+            Some("scope_denied"),
+        );
+        assert_eq!(backend_guard.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_update_dev_server_script_rejects_repo_outside_scope() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let backend_guard = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::PUT);
+            then.status(500);
+        });
+
+        let scope_ws = Uuid::new_v4();
+        let scoped_repo = Uuid::new_v4();
+        let unrelated_repo = Uuid::new_v4();
+
+        let server = McpServer::new_workspace(&mock_server.base_url())
+            .with_scope_and_repos_for_test(scope_ws, vec![scoped_repo]);
+        let req = UpdateDevServerScriptRequest {
+            repo_id: unrelated_repo,
+            script: "npm run dev".to_string(),
+        };
+        let result = server
+            .update_dev_server_script(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .unwrap();
+
+        let body = error_json(&result);
+        assert_eq!(
+            body.get("error_kind").and_then(|v| v.as_str()),
+            Some("scope_denied"),
+        );
+        assert_eq!(backend_guard.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_update_setup_script_allows_repo_in_scope() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let scope_ws = Uuid::new_v4();
+        let scoped_repo = Uuid::new_v4();
+
+        let update_mock = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::PUT)
+                .path(format!("/api/repos/{scoped_repo}"));
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": {
+                    "id": scoped_repo.to_string(),
+                    "name": "ok",
+                    "display_name": "Ok",
+                    "path": "/tmp/ok",
+                    "setup_script": "echo hi",
+                    "cleanup_script": null,
+                    "archive_script": null,
+                    "copy_files": null,
+                    "parallel_setup_script": false,
+                    "dev_server_script": null,
+                    "default_target_branch": null,
+                    "default_working_dir": null,
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z"
+                }
+            }));
+        });
+
+        let server = McpServer::new_workspace(&mock_server.base_url())
+            .with_scope_and_repos_for_test(scope_ws, vec![scoped_repo]);
+        let req = UpdateSetupScriptRequest {
+            repo_id: scoped_repo,
+            script: "echo hi".to_string(),
+        };
+        let result = server
+            .update_setup_script(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        update_mock.assert_hits(1);
     }
 }

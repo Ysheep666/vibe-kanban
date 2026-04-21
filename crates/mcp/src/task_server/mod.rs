@@ -139,6 +139,35 @@ impl McpServer {
         self
     }
 
+    /// Companion to `with_scope_for_test` that seeds the scoped workspace's
+    /// repo set. Used by tests that exercise `require_repo_in_scope` — the
+    /// scope guard reads `context.workspace_repos` to decide whether a
+    /// repo-level mutation is in-scope.
+    #[cfg(test)]
+    pub(crate) fn with_scope_and_repos_for_test(
+        mut self,
+        workspace_id: Uuid,
+        repo_ids: Vec<Uuid>,
+    ) -> Self {
+        self.context = Some(McpContext {
+            organization_id: None,
+            project_id: None,
+            issue_id: None,
+            orchestrator_session_id: None,
+            workspace_id,
+            workspace_branch: "main".to_string(),
+            workspace_repos: repo_ids
+                .into_iter()
+                .map(|id| McpRepoContext {
+                    repo_id: id,
+                    repo_name: format!("repo-{id}"),
+                    target_branch: "main".to_string(),
+                })
+                .collect(),
+        });
+        self
+    }
+
     async fn fetch_context_at_startup(&self) -> anyhow::Result<Option<McpContext>> {
         let current_dir = std::env::current_dir().context("Failed to resolve current directory")?;
         let canonical_path = current_dir.canonicalize().unwrap_or(current_dir);
