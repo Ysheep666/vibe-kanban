@@ -683,4 +683,144 @@ mod tests {
         let err = McpServer::parse_task_status("frobnicated").unwrap_err();
         assert!(err.to_string().contains("Unknown task status"));
     }
+
+    // ----------------------------------------------------------------------
+    // `require_parent_in_scope` — Workspace-mode direct unit coverage.
+    //
+    // Workspace mode was added to the enforcement branch in the same commit
+    // that introduced Task 2 of the v4.2 Workspace-mode plan. Prior to that,
+    // only Orchestrator mode rejected out-of-scope parent tasks; Workspace
+    // mode silently allowed them. The tests below pin the Workspace branches
+    // so regressions (e.g. reverting to `matches!(.., McpMode::Orchestrator)`)
+    // surface immediately rather than only transitively through per-tool tests.
+    // ----------------------------------------------------------------------
+
+    /// Build a `Task` fixture by deserializing JSON — avoids depending on
+    /// chrono directly just to stamp `created_at`/`updated_at`.
+    fn mock_task(id: Uuid, parent_workspace_id: Option<Uuid>) -> Task {
+        serde_json::from_value(serde_json::json!({
+            "id": id.to_string(),
+            "project_id": Uuid::new_v4().to_string(),
+            "title": "t",
+            "description": null,
+            "status": "todo",
+            "parent_workspace_id": parent_workspace_id.map(|p| p.to_string()),
+            "created_at": "2025-01-01T00:00:00Z",
+            "updated_at": "2025-01-01T00:00:00Z",
+        }))
+        .expect("mock Task fixture must deserialize")
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_require_parent_in_scope_rejects_task_with_no_parent() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        // No HTTP calls should be needed — the `parent_workspace_id.is_none()`
+        // branch denies immediately. A catch-all fails the test if that
+        // invariant regresses.
+        let catch_all = mock_server.mock(|when, then| {
+            when.any_request();
+            then.status(500);
+        });
+
+        let scope = Uuid::new_v4();
+        let task = mock_task(Uuid::new_v4(), None);
+
+        let server = McpServer::new_workspace(&mock_server.base_url()).with_scope_for_test(scope);
+
+        let mut cache = std::collections::HashMap::new();
+        let result = server.require_parent_in_scope(&task, &mut cache).await;
+        assert!(
+            result.is_err(),
+            "Workspace-mode with scope set must reject tasks that have no parent_workspace_id",
+        );
+        assert_eq!(catch_all.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_require_parent_in_scope_rejects_unrelated_parent() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let scope = Uuid::new_v4();
+        let unrelated_parent = Uuid::new_v4();
+        let task_parent_ws_id = Uuid::new_v4();
+        let grand_parent_task_id = Uuid::new_v4();
+
+        // `check_scope_allows_workspace` climbs the parent chain: it fetches
+        // the target workspace, then the task that workspace belongs to, then
+        // compares that task's parent_workspace_id to the scope. Mock both so
+        // the chain terminates in an unrelated parent (not the scope).
+        mock_server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/api/workspaces/{task_parent_ws_id}"));
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": {
+                    "id": task_parent_ws_id.to_string(),
+                    "task_id": grand_parent_task_id.to_string(),
+                    "container_ref": null,
+                    "branch": "main",
+                    "setup_completed_at": null,
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z",
+                    "archived": false,
+                    "pinned": false,
+                    "name": null,
+                    "worktree_deleted": false,
+                }
+            }));
+        });
+        mock_server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/api/tasks/{grand_parent_task_id}"));
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": {
+                    "id": grand_parent_task_id.to_string(),
+                    "project_id": Uuid::new_v4().to_string(),
+                    "title": "parent-task",
+                    "description": null,
+                    "status": "todo",
+                    "parent_workspace_id": unrelated_parent.to_string(),
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z",
+                }
+            }));
+        });
+
+        let task = mock_task(Uuid::new_v4(), Some(task_parent_ws_id));
+        let server = McpServer::new_workspace(&mock_server.base_url()).with_scope_for_test(scope);
+
+        let mut cache = std::collections::HashMap::new();
+        let result = server.require_parent_in_scope(&task, &mut cache).await;
+        assert!(
+            result.is_err(),
+            "Workspace-mode with scope set must reject tasks whose parent chain does not reach the scope",
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_require_parent_in_scope_allows_scope_self_parent() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        // parent_workspace_id == scope → `check_scope_allows_workspace`
+        // short-circuits to true without any HTTP call.
+        let catch_all = mock_server.mock(|when, then| {
+            when.any_request();
+            then.status(500);
+        });
+
+        let scope = Uuid::new_v4();
+        let task = mock_task(Uuid::new_v4(), Some(scope));
+
+        let server = McpServer::new_workspace(&mock_server.base_url()).with_scope_for_test(scope);
+
+        let mut cache = std::collections::HashMap::new();
+        let result = server.require_parent_in_scope(&task, &mut cache).await;
+        assert!(
+            result.is_ok(),
+            "Workspace-mode task whose parent IS the scope must be allowed",
+        );
+        assert_eq!(catch_all.hits(), 0);
+    }
 }
