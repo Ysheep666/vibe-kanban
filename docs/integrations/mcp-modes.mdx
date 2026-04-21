@@ -26,8 +26,8 @@ launches from inside a VK worktree. Fresh installs default to
   `parent_workspace_id` to). Use for admin scripts or CI.
   </Card>
   <Card title="Orchestrator" icon="robot">
-  VK-internal only. A lean tool surface pinned to one parent task.
-  Not user-facing.
+  VK-internal only. A lean tool surface scoped to the workspace
+  supplied by the VK executor. Not user-facing.
   </Card>
 </CardGroup>
 
@@ -54,7 +54,7 @@ Workspace default.
 
 | Behaviour | Workspace | Global | Orchestrator |
 |-----------|-----------|--------|--------------|
-| CWD auto-scope to a VK worktree | Yes | No | Pinned to parent task |
+| CWD auto-scope to a VK worktree | Yes | No | Scope supplied by VK executor |
 | Cross-workspace mutations allowed | Rejected with a pointer to `--mode global` | Yes | No |
 | Cross-repo mutations on scripts | Rejected with `error_kind="scope_denied"` | Yes | Rejected |
 | Tool surface | Global admin tools + task orchestration | Admin tools only (no task orchestration) | Lean orchestrator surface |
@@ -92,6 +92,18 @@ a snapshot of that workspace's repo set.
   scoped workspace or its descendant chain.
 - **Mutations with implicit workspace** (session tools) inherit scope
   from the resource they act on.
+- **Issue, issue-tag, issue-assignee, and issue-relationship
+  mutations** (`create_issue`, `update_issue`, `delete_issue`,
+  `add_issue_tag`, `remove_issue_tag`, `assign_issue`,
+  `unassign_issue`, `create_issue_relationship`,
+  `delete_issue_relationship`) are **not** scope-guarded. VK's scope
+  model is workspace-first: these resources hang off the organisation
+  or project, not a specific workspace, so there is no workspace id
+  to check against the scope. Tag mutations (`create_tag`,
+  `update_tag`, `delete_tag`) are the exception — they carry a scope
+  guard because deleting a tag destroys every tag→issue link in one
+  shot, and that blast radius is more costly to recover from than a
+  typical issue mutation.
 
 If the agent's CWD doesn't match any VK worktree, Workspace mode
 disables the scope check for that session — behaviour equivalent to
@@ -178,9 +190,9 @@ reference.
 
 ### Orchestrator
 
-Orchestrator pins a lean surface to a single parent task. It is only
-launched by VK itself — end users do not configure this mode. The full
-surface:
+Orchestrator exposes a lean tool surface scoped to the workspace
+supplied by the VK executor. It is only launched by VK itself — end
+users do not configure this mode. The full surface:
 
 - **Context** — `get_context`
 - **Workspaces** — `update_workspace`

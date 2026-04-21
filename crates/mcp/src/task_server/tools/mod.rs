@@ -182,18 +182,44 @@ use std::collections::HashMap;
 
 impl McpServer {
     /// Build the "scope denied" `ToolError` with consistent wording and
-    /// the diagnostic `requested={…} configured={…}` detail line.
+    /// the diagnostic `requested workspace_id={…} configured workspace_id={…}`
+    /// detail line.
     ///
     /// Only call this on the path where `check_scope_allows_workspace`
     /// returned `false` — at which point `scoped_workspace_id()` is known
     /// to be `Some(_)` (the only `false` branch that short-circuits on
     /// `None` returns `true`). We still render `<none>` defensively.
+    ///
+    /// For task-scope guards (e.g. `require_parent_in_scope`), use
+    /// [`Self::scope_denied_task_error`] instead — otherwise the error
+    /// detail line mislabels a `task_id` as `workspace_id` and operators
+    /// following the diagnostic go chasing a workspace that never existed.
     fn scope_denied_error(&self, requested: Uuid) -> ToolError {
+        self.build_scope_denied_error("workspace_id", requested)
+    }
+
+    /// Task-scope variant of [`Self::scope_denied_error`].
+    ///
+    /// Used by `require_parent_in_scope`, where the caller has a `Task`
+    /// (not a workspace) whose parent chain failed to reach the scope —
+    /// the rendered detail line must label the offending id as `task_id=`
+    /// so operators can look it up in the right table.
+    ///
+    /// Error kind + wording stay identical to the workspace variant so the
+    /// MCP wire contract (`error_kind = "scope_denied"`) is preserved.
+    fn scope_denied_task_error(&self, requested_task_id: Uuid) -> ToolError {
+        self.build_scope_denied_error("task_id", requested_task_id)
+    }
+
+    /// Shared trunk for both scope-denied helpers. Keeps the top-level
+    /// message, the `configured workspace_id=` suffix, and the
+    /// `error_kind = "scope_denied"` contract in one place so the two
+    /// variants can never drift apart.
+    fn build_scope_denied_error(&self, requested_kind: &str, requested: Uuid) -> ToolError {
         ToolError::new(
             "Operation is outside the configured workspace scope",
             Some(format!(
-                "requested workspace_id={}, configured workspace_id={}",
-                requested,
+                "requested {requested_kind}={requested}, configured workspace_id={}",
                 self.scoped_workspace_id()
                     .map(|id| id.to_string())
                     .unwrap_or_else(|| "<none>".to_string())
@@ -1107,8 +1133,49 @@ mod tests {
             let err = server.scope_denied_error(requested);
             assert_eq!(err.error_kind.as_deref(), Some("scope_denied"));
 
+            let details = err
+                .details
+                .as_deref()
+                .expect("scope_denied error must carry a details line");
+            assert!(
+                details.contains(&format!("requested workspace_id={requested}")),
+                "workspace-scope helper must label the offending id as workspace_id, got: {details}",
+            );
+
             let value = McpServer::tool_error_value(err);
             assert_eq!(value["error_kind"], json!("scope_denied"));
+        }
+
+        #[test]
+        fn scope_denied_task_error_labels_id_as_task_id() {
+            // Task-scope variant of the workspace helper above. Distinct
+            // label is load-bearing for operators: a `task_id` rendered as
+            // `workspace_id=` sends them chasing the wrong row. The
+            // `error_kind` stays `"scope_denied"` so the wire contract does
+            // not branch by id-shape.
+            let scope = uuid::Uuid::new_v4();
+            let task_id = uuid::Uuid::new_v4();
+            let server = McpServer::new_workspace("http://test").with_scope_for_test(scope);
+            let err = server.scope_denied_task_error(task_id);
+
+            assert_eq!(err.error_kind.as_deref(), Some("scope_denied"));
+
+            let details = err
+                .details
+                .as_deref()
+                .expect("scope_denied error must carry a details line");
+            assert!(
+                details.contains(&format!("requested task_id={task_id}")),
+                "task-scope helper must label the offending id as task_id, got: {details}",
+            );
+            assert!(
+                !details.contains("requested workspace_id="),
+                "task-scope helper must not mislabel a task id as workspace_id, got: {details}",
+            );
+            assert!(
+                details.contains(&format!("configured workspace_id={scope}")),
+                "details must still surface the configured scope, got: {details}",
+            );
         }
     }
 }
