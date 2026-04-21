@@ -112,13 +112,15 @@ include:
   `list_sessions`, `run_session_prompt`, `get_execution`
 - **Organisations** — `list_organizations`, `list_org_members`
 - **Projects** — `list_projects`
-- **Repositories** — `list_repos`, `get_repo`, `update_setup_script`,
-  `update_cleanup_script`, `update_dev_server_script`
+- **Repositories** — `list_repos`, `get_repo`, `add_repo`,
+  `delete_repo`, `update_setup_script`, `update_cleanup_script`,
+  `update_dev_server_script`
 - **Issues** — `list_issues`, `create_issue`, `get_issue`,
   `update_issue`, `delete_issue`, `list_issue_priorities`
 - **Issue assignees** — `list_issue_assignees`, `assign_issue`,
   `unassign_issue`
-- **Issue tags** — `list_tags`, `list_issue_tags`, `add_issue_tag`,
+- **Tags** — `list_tags`, `create_tag`, `update_tag`, `delete_tag`
+- **Issue tags** — `list_issue_tags`, `add_issue_tag`,
   `remove_issue_tag`
 - **Issue relationships** — `create_issue_relationship`,
   `delete_issue_relationship`
@@ -131,11 +133,17 @@ reference.
 
 ### Orchestrator
 
-Orchestrator is a lean 14-tool surface pinned to a single parent task.
-It exposes context, a scoped subset of workspace tools (excluding
-`list_workspaces` and `delete_workspace`), the session tools, and the
-orchestrator-only task tools. It is only launched by VK itself — end
-users do not configure this mode.
+Orchestrator pins a lean 14-tool surface to a single parent task. It is
+only launched by VK itself — end users do not configure this mode. The
+full surface:
+
+- **Context** — `get_context`
+- **Workspaces** — `update_workspace`
+- **Workspace sessions** — `create_session`, `list_sessions`,
+  `read_session_messages`, `run_session_prompt`, `update_session`,
+  `get_execution`
+- **Tasks** — `list_tasks`, `get_task`, `create_task`,
+  `create_and_start_task`, `update_task_status`, `delete_task`
 
 ## When to pick Global over Workspace
 
