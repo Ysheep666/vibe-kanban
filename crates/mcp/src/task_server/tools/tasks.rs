@@ -188,7 +188,11 @@ impl McpServer {
     /// orchestrator mode. Returns Ok(()) for global mode or out-of-scope
     /// cases handled elsewhere. Returns Err with a ready-to-use ToolError
     /// when the parent is denied.
-    async fn enforce_parent_scope(&self, parent: Uuid) -> Result<(), ToolError> {
+    ///
+    /// Exposed as `pub(super)` so sibling modules (e.g. `task_attempts`
+    /// which also accepts `parent_workspace_id` via `start_workspace`) can
+    /// reuse the same guard without duplicating the scope-cache boilerplate.
+    pub(super) async fn enforce_parent_scope(&self, parent: Uuid) -> Result<(), ToolError> {
         let mut scope_cache = std::collections::HashMap::new();
         if !check_scope_allows_workspace(self, &mut scope_cache, parent).await {
             return Err(self.scope_denied_error(parent));

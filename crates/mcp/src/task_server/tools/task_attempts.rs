@@ -100,7 +100,9 @@ fn build_workspace_prompt_from_issue(issue: &api_types::Issue) -> Option<String>
 
 #[tool_router(router = task_attempts_tools_router, vis = "pub")]
 impl McpServer {
-    #[tool(description = "Create a new workspace and start its first session.")]
+    #[tool(
+        description = "Create a new workspace and start its first session. When `parent_workspace_id` is set in Workspace or Orchestrator mode, the parent must be the scoped workspace or a descendant via the task parent-chain — otherwise the tool rejects with error_kind=\"scope_denied\". Cross-workspace parenting requires --mode global."
+    )]
     async fn start_workspace(
         &self,
         Parameters(StartWorkspaceRequest {
@@ -167,6 +169,14 @@ impl McpServer {
 
         // Parent-workspace branch: route through /api/tasks/start (atomic tx).
         if let Some(parent) = parent_workspace_id {
+            // Keep `start_workspace` in lock-step with `create_and_start_task`
+            // — both land at the same `/api/tasks/start` handler, so scope
+            // enforcement must be symmetric. Short-circuits before any HTTP
+            // round-trip to `/api/tasks/start`.
+            if let Err(e) = self.enforce_parent_scope(parent).await {
+                return Ok(Self::tool_error(e));
+            }
+
             let workspace_prompt = match prompt {
                 Some(prompt) => prompt,
                 None => {
@@ -447,6 +457,99 @@ mod tests {
             link_guard.hits(),
             0,
             "POST /api/workspaces/{{id}}/links must not fire when scope denies",
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_start_workspace_rejects_unrelated_parent() {
+        // `start_workspace` with `parent_workspace_id` routes through
+        // `POST /api/tasks/start` just like `create_and_start_task` — and
+        // mcp-modes.mdx promises "Mutations that name a workspace ID are
+        // rejected unless the target is the scoped workspace or a
+        // descendant". Keep `start_workspace` in lock-step with
+        // `create_and_start_task` (tasks.rs) rather than leaving a second,
+        // silently-unguarded entrypoint onto the same atomic backend tx.
+        install_rustls();
+        let mock = MockServer::start();
+        let scope = Uuid::new_v4();
+        let unrelated_parent = Uuid::new_v4();
+        let unrelated_parent_task = Uuid::new_v4();
+        let other_parent = Uuid::new_v4();
+
+        // Scope climb: parent workspace → its task → task's parent workspace
+        // is `other_parent`, not the scoped workspace, so deny.
+        mock.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/api/workspaces/{unrelated_parent}"));
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": {
+                    "id": unrelated_parent.to_string(),
+                    "task_id": unrelated_parent_task.to_string(),
+                    "container_ref": null,
+                    "branch": "main",
+                    "setup_completed_at": null,
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z",
+                    "archived": false,
+                    "pinned": false,
+                    "name": null,
+                    "worktree_deleted": false,
+                }
+            }));
+        });
+        mock.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/api/tasks/{unrelated_parent_task}"));
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": {
+                    "id": unrelated_parent_task.to_string(),
+                    "project_id": Uuid::new_v4().to_string(),
+                    "title": "t",
+                    "description": null,
+                    "status": "todo",
+                    "parent_workspace_id": other_parent.to_string(),
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z",
+                }
+            }));
+        });
+        // `POST /api/tasks/start` must NEVER fire when scope denies — catch
+        // it with 500 so a regression (guard dropped, or new code path
+        // bypassing the guard) surfaces loudly instead of silently
+        // consuming backend capacity.
+        let start_guard = mock.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/api/tasks/start");
+            then.status(500);
+        });
+
+        let server = McpServer::new_workspace(&mock.base_url()).with_scope_for_test(scope);
+        let req = StartWorkspaceRequest {
+            name: "child-ws".to_string(),
+            prompt: Some("do the thing".to_string()),
+            executor: "CLAUDE_CODE".to_string(),
+            variant: None,
+            repositories: vec![McpWorkspaceRepoInput {
+                repo_id: Uuid::new_v4(),
+                branch: "main".to_string(),
+            }],
+            issue_id: None,
+            parent_workspace_id: Some(unrelated_parent),
+            project_id: Some(Uuid::new_v4()),
+        };
+        let result = server.start_workspace(Parameters(req)).await.unwrap();
+
+        let body = error_json(&result);
+        assert_eq!(
+            body.get("error_kind").and_then(|v| v.as_str()),
+            Some("scope_denied"),
+            "expected scope_denied: {body}"
+        );
+        assert_eq!(
+            start_guard.hits(),
+            0,
+            "POST /api/tasks/start must not fire when the parent workspace is out of scope",
         );
     }
 }
