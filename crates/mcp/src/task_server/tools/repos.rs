@@ -30,10 +30,12 @@ struct GetRepoRequest {
 struct RepoDetails {
     #[schemars(description = "The unique identifier of the repository")]
     id: String,
-    #[schemars(description = "The name of the repository")]
+    #[schemars(description = "The short (slug) name of the repository")]
     name: String,
-    #[schemars(description = "The display name of the repository")]
+    #[schemars(description = "The human-readable display name of the repository")]
     display_name: String,
+    #[schemars(description = "Absolute filesystem path of the repository on this machine")]
+    path: String,
     #[schemars(description = "The setup script that runs when initializing a workspace")]
     setup_script: Option<String>,
     #[schemars(description = "The cleanup script that runs when tearing down a workspace")]
@@ -160,6 +162,7 @@ impl McpServer {
             id: repo.id.to_string(),
             name: repo.name,
             display_name: repo.display_name,
+            path: repo.path.to_string_lossy().into_owned(),
             setup_script: repo.setup_script,
             cleanup_script: repo.cleanup_script,
             dev_server_script: repo.dev_server_script,
@@ -495,5 +498,50 @@ mod tests {
         assert_eq!(first["name"], "vibe-kanban");
         assert_eq!(first["display_name"], "Vibe Kanban");
         assert_eq!(first["path"], "/home/alice/code/vibe-kanban");
+    }
+
+    #[tokio::test]
+    async fn get_repo_returns_path() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let repo_id = Uuid::new_v4();
+        mock_server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/api/repos/{repo_id}"));
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": {
+                    "id": repo_id.to_string(),
+                    "name": "vibe-kanban",
+                    "display_name": "Vibe Kanban",
+                    "path": "/home/alice/code/vibe-kanban",
+                    "setup_script": null,
+                    "cleanup_script": null,
+                    "archive_script": null,
+                    "copy_files": null,
+                    "parallel_setup_script": false,
+                    "dev_server_script": null,
+                    "default_target_branch": null,
+                    "default_working_dir": null,
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z"
+                }
+            }));
+        });
+        let server = McpServer::new_global(&mock_server.base_url());
+        let req = GetRepoRequest { repo_id };
+        let result = server
+            .get_repo(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .expect("get_repo must succeed");
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["id"], repo_id.to_string());
+        assert_eq!(v["name"], "vibe-kanban");
+        assert_eq!(v["display_name"], "Vibe Kanban");
+        assert_eq!(v["path"], "/home/alice/code/vibe-kanban");
     }
 }

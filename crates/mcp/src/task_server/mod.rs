@@ -16,7 +16,7 @@ pub(crate) use crate::ApiResponseEnvelope;
 pub struct McpRepoContext {
     #[schemars(description = "The unique identifier of the repository")]
     pub repo_id: Uuid,
-    #[schemars(description = "The name of the repository")]
+    #[schemars(description = "The short (slug) name of the repository")]
     pub repo_name: String,
     #[schemars(description = "The target branch for this repository in this workspace")]
     pub target_branch: String,
