@@ -377,6 +377,24 @@ pub async fn delete_repo(
     Ok((StatusCode::OK, ResponseJson(ApiResponse::success(()))))
 }
 
+pub fn router() -> Router<DeploymentImpl> {
+    Router::new()
+        .route("/repos", get(get_repos).post(register_repo))
+        .route("/repos/recent", get(get_recent_repos))
+        .route("/repos/init", post(init_repo))
+        .route("/repos/batch", post(get_repos_batch))
+        .route(
+            "/repos/{repo_id}",
+            get(get_repo).put(update_repo).delete(delete_repo),
+        )
+        .route("/repos/{repo_id}/branches", get(get_repo_branches))
+        .route("/repos/{repo_id}/remotes", get(get_repo_remotes))
+        .route("/repos/{repo_id}/prs", get(list_open_prs))
+        .route("/repos/pr-info", get(get_pr_info))
+        .route("/repos/{repo_id}/search", get(search_repo))
+        .route("/repos/{repo_id}/open-editor", post(open_repo_in_editor))
+}
+
 #[cfg(test)]
 mod delete_repo_query_tests {
     use super::*;
@@ -398,22 +416,4 @@ mod delete_repo_query_tests {
         let q: DeleteRepoQuery = serde_urlencoded::from_str("force=false").unwrap();
         assert!(!q.force);
     }
-}
-
-pub fn router() -> Router<DeploymentImpl> {
-    Router::new()
-        .route("/repos", get(get_repos).post(register_repo))
-        .route("/repos/recent", get(get_recent_repos))
-        .route("/repos/init", post(init_repo))
-        .route("/repos/batch", post(get_repos_batch))
-        .route(
-            "/repos/{repo_id}",
-            get(get_repo).put(update_repo).delete(delete_repo),
-        )
-        .route("/repos/{repo_id}/branches", get(get_repo_branches))
-        .route("/repos/{repo_id}/remotes", get(get_repo_remotes))
-        .route("/repos/{repo_id}/prs", get(list_open_prs))
-        .route("/repos/pr-info", get(get_pr_info))
-        .route("/repos/{repo_id}/search", get(search_repo))
-        .route("/repos/{repo_id}/open-editor", post(open_repo_in_editor))
 }
