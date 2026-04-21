@@ -544,8 +544,16 @@ mod tests {
             0,
             "self-scope target must not trigger a parent-chain climb",
         );
-        assert_eq!(issue_hit.hits(), 1, "issue lookup must fire on success path");
-        assert_eq!(link_hit.hits(), 1, "link mutation must fire on success path");
+        assert_eq!(
+            issue_hit.hits(),
+            1,
+            "issue lookup must fire on success path"
+        );
+        assert_eq!(
+            link_hit.hits(),
+            1,
+            "link mutation must fire on success path"
+        );
     }
 
     #[tokio::test]
