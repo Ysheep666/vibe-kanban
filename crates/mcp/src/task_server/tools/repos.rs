@@ -254,7 +254,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Register an existing git repository by absolute path. Returns the new repo record. Fails with error_kind='invalid_repo' if path is not a git repo."
+        description = "Register an existing git repository by absolute path. Returns the new repo record. Fails with a 400-style error envelope (message='not a git repository') when the path is not a git repo; future server releases may also set error_kind='invalid_repo' on that envelope."
     )]
     async fn add_repo(
         &self,
@@ -278,7 +278,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Delete a repository. Rejects with error_kind/error_data surfacing active workspaces if any reference the repo; pass force=true to delete anyway."
+        description = "Delete a repository. When active workspaces reference the repo, rejects with a 409 envelope whose error_data = {message, workspaces: string[]} lists the blocking workspace branches; pass force=true to delete anyway. Future server releases may also set error_kind on that envelope."
     )]
     async fn delete_repo(
         &self,

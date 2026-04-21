@@ -40,6 +40,14 @@ impl ApiClient {
         self.get_json(&format!("/api/tasks/{id}")).await
     }
 
+    /// Register a repo via `POST /api/repos`.
+    ///
+    /// NOTE: The MCP `add_repo` tool does NOT use this helper. The tool issues
+    /// the raw HTTP call via `send_json` so the server's full error envelope —
+    /// including any `error_kind` the server starts populating — reaches the
+    /// AI caller untouched. This helper is for non-MCP consumers (e.g. future
+    /// background maintenance code) that are happy to collapse non-success
+    /// responses into `ApiClientError::Server(message)`.
     pub async fn register_repo(&self, path: &str, display_name: Option<&str>) -> ApiResult<Repo> {
         let url = format!("{}/api/repos", self.base_url);
         let body = serde_json::json!({
@@ -56,6 +64,15 @@ impl ApiClient {
         envelope.into_data().ok_or(ApiClientError::BadShape)
     }
 
+    /// Delete a repo via `DELETE /api/repos/:id[?force=true]`.
+    ///
+    /// NOTE: The MCP `delete_repo` tool does NOT use this helper. The tool
+    /// issues the raw HTTP call via `send_empty_json` so the 409 conflict
+    /// body — specifically `error_data.workspaces: Vec<String>` that lists
+    /// the active workspaces blocking the delete — flows through to the AI
+    /// caller intact. This helper deliberately collapses any non-success
+    /// response into `ApiClientError::Server(message)`, dropping `error_data`.
+    /// Use it only when you don't need the structured conflict payload.
     pub async fn delete_repo(&self, id: Uuid, force: bool) -> ApiResult<()> {
         let url = format!("{}/api/repos/{id}", self.base_url);
         let mut req = self.client.delete(url);
