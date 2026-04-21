@@ -382,6 +382,12 @@ export type CreateFollowUpAttempt = { prompt: string, executor_config: ExecutorC
 
 export type ResetProcessRequest = { process_id: string, force_when_dirty: boolean | null, perform_git_reset: boolean | null, };
 
+export type MessagesQuery = { last_n: number | null, from_index: number | null, include_thinking: boolean, };
+
+export type SessionMessage = { index: number, entry_type: string, content: string, timestamp: string | null, metadata: JsonValue | null, };
+
+export type SessionMessagesResponse = { messages: Array<SessionMessage>, total_count: number, has_more: boolean, final_assistant_message: string | null, };
+
 export type ChangeTargetBranchRequest = { repo_id: string, new_target_branch: string, };
 
 export type ChangeTargetBranchResponse = { repo_id: string, new_target_branch: string, status: [number, number], };
@@ -484,6 +490,22 @@ export type GetPrCommentsQuery = { repo_id: string, };
 export type CreateAndStartWorkspaceRequest = { name: string | null, repos: Array<WorkspaceRepoInput>, linked_issue: LinkedIssueInfo | null, executor_config: ExecutorConfig, prompt: string, attachment_ids: Array<string> | null, adopt_cursor_mcp_lobby_bridge_session_id?: string | null, };
 
 export type CreateAndStartWorkspaceResponse = { workspace: Workspace, execution_process: ExecutionProcess, };
+
+export type StartTaskRequest = { task: StartTaskTaskSpec, workspace: StartTaskWorkspaceSpec, };
+
+export type StartTaskTaskSpec = { project_id: string, title: string, description?: string | null, parent_workspace_id?: string | null, };
+
+export type StartTaskWorkspaceSpec = { name?: string | null, repos: Array<WorkspaceRepoInput>, executor_config: ExecutorConfig, prompt: string, };
+
+export type StartTaskResponse = { task_id: string, workspace_id: string, execution_id: string, };
+
+export type Task = { id: string, project_id: string, title: string, description: string | null, status: TaskStatus, parent_workspace_id: string | null, created_at: string, updated_at: string, };
+
+export type TaskStatus = "todo" | "inprogress" | "inreview" | "done" | "cancelled";
+
+export type CreateTask = { project_id: string, title: string, description: string | null, parent_workspace_id: string | null, };
+
+export type UpdateTask = { title: string | null, description?: string | null, status: TaskStatus | null, };
 
 export type UnifiedPrComment = { "comment_type": "general", id: string, author: string, author_association: string | null, body: string, created_at: string, url: string | null, } | { "comment_type": "review", id: bigint, author: string, author_association: string | null, body: string, created_at: string, url: string | null, path: string, line: bigint | null, side: string | null, diff_hunk: string | null, };
 
