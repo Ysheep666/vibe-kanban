@@ -314,7 +314,7 @@ export type UpdateMemberRoleRequest = { role: MemberRole, };
 
 export type UpdateMemberRoleResponse = { user_id: string, role: MemberRole, };
 
-export type DeleteTagConflict = { message: string, issue_tag_count: bigint, };
+export type DeleteTagConflict = { message: string, issue_tag_count: number, };
 
 export type RegisterRepoRequest = { path: string, display_name: string | null, };
 

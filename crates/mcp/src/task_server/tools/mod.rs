@@ -199,14 +199,16 @@ impl McpServer {
                     .unwrap_or_else(|| "<none>".to_string())
             )),
         )
+        .with_error_kind("scope_denied")
     }
 }
 
-/// Async, memoised scope check for orchestrator mode.
+/// Async, memoised scope check for Workspace and Orchestrator modes.
 ///
 /// Returns `true` if `target` is allowed under the server's configured scope:
-/// - Non-orchestrator mode: always allowed.
-/// - No scoped workspace set: always allowed.
+/// - Global mode: always allowed (no scope in effect).
+/// - No scoped workspace set (Workspace graceful fallback or Orchestrator
+///   test paths): always allowed.
 /// - Same workspace as scope: allowed (no HTTP needed).
 /// - Child workspace (target's task points back to scope): allowed after HTTP lookup.
 /// - Anything else: denied.
@@ -990,6 +992,22 @@ mod tests {
             assert!(value.get("error_kind").is_none());
             assert!(value.get("error_data").is_none());
             assert!(value.get("body_tail").is_none());
+        }
+
+        #[test]
+        fn scope_denied_error_sets_error_kind() {
+            // The mcp-modes.mdx decision tree tells agents to branch on
+            // `error_kind = "scope_denied"`. Lock that contract in — a
+            // future refactor that drops the kind would silently break
+            // programmatic "retry with --mode global" handling.
+            let scope = uuid::Uuid::new_v4();
+            let requested = uuid::Uuid::new_v4();
+            let server = McpServer::new_workspace("http://test").with_scope_for_test(scope);
+            let err = server.scope_denied_error(requested);
+            assert_eq!(err.error_kind.as_deref(), Some("scope_denied"));
+
+            let value = McpServer::tool_error_value(err);
+            assert_eq!(value["error_kind"], json!("scope_denied"));
         }
     }
 }

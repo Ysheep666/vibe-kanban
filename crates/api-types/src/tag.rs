@@ -44,5 +44,5 @@ pub struct ListTagsResponse {
 #[derive(Debug, Serialize, TS)]
 pub struct DeleteTagConflict {
     pub message: String,
-    pub issue_tag_count: i64,
+    pub issue_tag_count: i32,
 }

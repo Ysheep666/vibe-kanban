@@ -811,6 +811,10 @@ async fn delete_tag(
                 .await
                 .map_err(ApiError::Database)?;
         if count > 0 {
+            // Clamp to i32 to match the TS-facing `DeleteTagConflict` shape;
+            // saturating at i32::MAX is safe because issue_tag counts cannot
+            // realistically exceed 2B per tag.
+            let clamped = i32::try_from(count).unwrap_or(i32::MAX);
             return Ok((
                 axum::http::StatusCode::CONFLICT,
                 ResponseJson(json!({
@@ -820,7 +824,7 @@ async fn delete_tag(
                     ),
                     "error_data": {
                         "message": format!("Tag is referenced by {count} issue_tag(s)."),
-                        "issue_tag_count": count,
+                        "issue_tag_count": clamped,
                     }
                 })),
             ));
