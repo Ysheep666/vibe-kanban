@@ -823,4 +823,302 @@ mod tests {
         );
         assert_eq!(catch_all.hits(), 0);
     }
+
+    // ----------------------------------------------------------------------
+    // Tool-level coverage for `create_task` + `create_and_start_task` in
+    // Workspace mode.
+    //
+    // `require_parent_in_scope_*` above covers the in-memory guard directly.
+    // These tests exercise the full tool path: parameters → scope resolution
+    // → HTTP mutation (or refusal to mutate). They lock two behaviours:
+    //
+    //   1. When `parent_workspace_id` is omitted, Workspace mode auto-fills
+    //      it with the scoped workspace id before sending the payload.
+    //   2. When `parent_workspace_id` is explicit and unrelated to the
+    //      scope, the tool rejects with `error_kind="scope_denied"` and
+    //      does not reach the mutation endpoint (POST /api/tasks or
+    //      POST /api/tasks/start).
+    // ----------------------------------------------------------------------
+
+    /// Render a tool `CallToolResult` to JSON so individual fields (notably
+    /// `error_kind`) can be asserted on directly. Mirrors the helper in
+    /// `remote_tags.rs` tests.
+    fn error_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
+        assert!(
+            result.is_error.unwrap_or(false),
+            "expected tool error, got success: {result:?}"
+        );
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        };
+        serde_json::from_str(&text).expect("tool error body must be JSON")
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_create_task_auto_defaults_parent_to_scope() {
+        install_rustls();
+        let mock = MockServer::start();
+        let scope = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+
+        // `json_body_partial` on the create payload locks the defaulting
+        // behaviour: when the caller omits `parent_workspace_id` in
+        // Workspace mode, the server must still see it populated with the
+        // scoped workspace id (the Workspace-mode equivalent of
+        // Orchestrator's default).
+        let create_mock = mock.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/api/tasks")
+                .json_body_partial(
+                    serde_json::json!({
+                        "parent_workspace_id": scope.to_string(),
+                    })
+                    .to_string(),
+                );
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": {
+                    "id": task_id.to_string(),
+                    "project_id": project_id.to_string(),
+                    "title": "t",
+                    "description": null,
+                    "status": "todo",
+                    "parent_workspace_id": scope.to_string(),
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z",
+                }
+            }));
+        });
+
+        let server = McpServer::new_workspace(&mock.base_url()).with_scope_for_test(scope);
+        let req = McpCreateTaskRequest {
+            project_id: Some(project_id),
+            title: "child task".to_string(),
+            description: None,
+            parent_workspace_id: None,
+        };
+        let result = server.create_task(Parameters(req)).await.unwrap();
+        assert!(
+            result.is_error.unwrap_or(false) == false,
+            "create_task should succeed when parent defaults to scope: {result:?}"
+        );
+        create_mock.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_create_task_rejects_unrelated_parent() {
+        install_rustls();
+        let mock = MockServer::start();
+        let scope = Uuid::new_v4();
+        let unrelated_parent = Uuid::new_v4();
+        let intermediate_task_id = Uuid::new_v4();
+        let unrelated_grand_parent = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+
+        // The unrelated parent workspace exists and belongs to a task whose
+        // parent_workspace_id is not the scope — scope check climbs the chain,
+        // finds the mismatch, and denies. The POST /api/tasks mutation must
+        // never fire.
+        mock.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/api/workspaces/{unrelated_parent}"));
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": {
+                    "id": unrelated_parent.to_string(),
+                    "task_id": intermediate_task_id.to_string(),
+                    "container_ref": null,
+                    "branch": "main",
+                    "setup_completed_at": null,
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z",
+                    "archived": false,
+                    "pinned": false,
+                    "name": null,
+                    "worktree_deleted": false,
+                }
+            }));
+        });
+        mock.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/api/tasks/{intermediate_task_id}"));
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": {
+                    "id": intermediate_task_id.to_string(),
+                    "project_id": Uuid::new_v4().to_string(),
+                    "title": "parent-task",
+                    "description": null,
+                    "status": "todo",
+                    "parent_workspace_id": unrelated_grand_parent.to_string(),
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z",
+                }
+            }));
+        });
+        // Any mutation would be a regression — fail the test loudly.
+        let create_guard = mock.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/api/tasks");
+            then.status(500);
+        });
+
+        let server = McpServer::new_workspace(&mock.base_url()).with_scope_for_test(scope);
+        let req = McpCreateTaskRequest {
+            project_id: Some(project_id),
+            title: "child task".to_string(),
+            description: None,
+            parent_workspace_id: Some(unrelated_parent),
+        };
+        let result = server.create_task(Parameters(req)).await.unwrap();
+
+        let body = error_json(&result);
+        assert_eq!(
+            body.get("error_kind").and_then(|v| v.as_str()),
+            Some("scope_denied"),
+            "expected scope_denied: {body}"
+        );
+        assert_eq!(
+            create_guard.hits(),
+            0,
+            "POST /api/tasks must not fire when parent is out of scope",
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_create_and_start_task_auto_defaults_parent_to_scope() {
+        install_rustls();
+        let mock = MockServer::start();
+        let scope = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let new_workspace_id = Uuid::new_v4();
+        let execution_id = Uuid::new_v4();
+
+        let start_mock = mock.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/api/tasks/start")
+                .json_body_partial(
+                    serde_json::json!({
+                        "task": { "parent_workspace_id": scope.to_string() },
+                    })
+                    .to_string(),
+                );
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": {
+                    "task_id": task_id.to_string(),
+                    "workspace_id": new_workspace_id.to_string(),
+                    "execution_id": execution_id.to_string(),
+                }
+            }));
+        });
+
+        let server = McpServer::new_workspace(&mock.base_url()).with_scope_for_test(scope);
+        let req = McpCreateAndStartTaskRequest {
+            project_id: Some(project_id),
+            title: "child task".to_string(),
+            description: None,
+            parent_workspace_id: None,
+            workspace_name: Some("child-ws".to_string()),
+            repositories: vec![McpWorkspaceRepoInput {
+                repo_id,
+                branch: "main".to_string(),
+            }],
+            executor: "CODEX".to_string(),
+            variant: None,
+            prompt: "go".to_string(),
+        };
+        let result = server.create_and_start_task(Parameters(req)).await.unwrap();
+        assert!(
+            result.is_error.unwrap_or(false) == false,
+            "create_and_start_task should succeed when parent defaults to scope: {result:?}"
+        );
+        start_mock.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_create_and_start_task_rejects_unrelated_parent() {
+        install_rustls();
+        let mock = MockServer::start();
+        let scope = Uuid::new_v4();
+        let unrelated_parent = Uuid::new_v4();
+        let intermediate_task_id = Uuid::new_v4();
+        let unrelated_grand_parent = Uuid::new_v4();
+        let project_id = Uuid::new_v4();
+        let repo_id = Uuid::new_v4();
+
+        mock.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/api/workspaces/{unrelated_parent}"));
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": {
+                    "id": unrelated_parent.to_string(),
+                    "task_id": intermediate_task_id.to_string(),
+                    "container_ref": null,
+                    "branch": "main",
+                    "setup_completed_at": null,
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z",
+                    "archived": false,
+                    "pinned": false,
+                    "name": null,
+                    "worktree_deleted": false,
+                }
+            }));
+        });
+        mock.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/api/tasks/{intermediate_task_id}"));
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": {
+                    "id": intermediate_task_id.to_string(),
+                    "project_id": Uuid::new_v4().to_string(),
+                    "title": "parent-task",
+                    "description": null,
+                    "status": "todo",
+                    "parent_workspace_id": unrelated_grand_parent.to_string(),
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z",
+                }
+            }));
+        });
+        let start_guard = mock.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/api/tasks/start");
+            then.status(500);
+        });
+
+        let server = McpServer::new_workspace(&mock.base_url()).with_scope_for_test(scope);
+        let req = McpCreateAndStartTaskRequest {
+            project_id: Some(project_id),
+            title: "child task".to_string(),
+            description: None,
+            parent_workspace_id: Some(unrelated_parent),
+            workspace_name: Some("child-ws".to_string()),
+            repositories: vec![McpWorkspaceRepoInput {
+                repo_id,
+                branch: "main".to_string(),
+            }],
+            executor: "CODEX".to_string(),
+            variant: None,
+            prompt: "go".to_string(),
+        };
+        let result = server.create_and_start_task(Parameters(req)).await.unwrap();
+
+        let body = error_json(&result);
+        assert_eq!(
+            body.get("error_kind").and_then(|v| v.as_str()),
+            Some("scope_denied"),
+            "expected scope_denied: {body}"
+        );
+        assert_eq!(
+            start_guard.hits(),
+            0,
+            "POST /api/tasks/start must not fire when parent is out of scope",
+        );
+    }
 }
