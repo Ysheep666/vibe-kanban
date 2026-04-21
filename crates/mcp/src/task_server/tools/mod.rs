@@ -631,6 +631,13 @@ mod tests {
     }
 
     #[test]
+    fn global_mode_registers_new_repo_tools() {
+        let names = tool_names(McpServer::global_mode_router());
+        assert!(names.contains("add_repo"));
+        assert!(names.contains("delete_repo"));
+    }
+
+    #[test]
     fn workspace_mode_exposes_global_superset() {
         let workspace = tool_names(McpServer::workspace_mode_router());
         let global = tool_names(McpServer::global_mode_router());

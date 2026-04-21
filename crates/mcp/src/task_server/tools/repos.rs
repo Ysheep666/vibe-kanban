@@ -82,6 +82,40 @@ struct ListReposResponse {
     count: usize,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct AddRepoRequest {
+    #[schemars(
+        description = "Absolute filesystem path to an existing git repository on this machine."
+    )]
+    pub path: String,
+    #[schemars(description = "Optional human-readable display name. Defaults to the folder name.")]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct AddRepoResponse {
+    id: String,
+    name: String,
+    display_name: String,
+    path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct DeleteRepoRequest {
+    #[schemars(description = "ID of the repository to delete.")]
+    pub repo_id: Uuid,
+    #[schemars(
+        description = "If true, delete even when active workspaces reference this repo. Default: false."
+    )]
+    pub force: Option<bool>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct DeleteRepoResponse {
+    success: bool,
+    repo_id: String,
+}
+
 #[tool_router(router = repos_tools_router, vis = "pub")]
 impl McpServer {
     #[tool(description = "List all repositories.")]
@@ -218,6 +252,51 @@ impl McpServer {
             field: "dev_server_script".to_string(),
         })
     }
+
+    #[tool(
+        description = "Register an existing git repository by absolute path. Returns the new repo record. Fails with error_kind='invalid_repo' if path is not a git repo."
+    )]
+    async fn add_repo(
+        &self,
+        Parameters(AddRepoRequest { path, display_name }): Parameters<AddRepoRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let url = self.url("/api/repos");
+        let payload = serde_json::json!({
+            "path": path,
+            "display_name": display_name,
+        });
+        let repo: Repo = match self.send_json(self.client.post(&url).json(&payload)).await {
+            Ok(r) => r,
+            Err(e) => return Ok(Self::tool_error(e)),
+        };
+        McpServer::success(&AddRepoResponse {
+            id: repo.id.to_string(),
+            name: repo.name,
+            display_name: repo.display_name,
+            path: repo.path.to_string_lossy().into_owned(),
+        })
+    }
+
+    #[tool(
+        description = "Delete a repository. Rejects with error_kind/error_data surfacing active workspaces if any reference the repo; pass force=true to delete anyway."
+    )]
+    async fn delete_repo(
+        &self,
+        Parameters(DeleteRepoRequest { repo_id, force }): Parameters<DeleteRepoRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let url = self.url(&format!("/api/repos/{}", repo_id));
+        let mut req = self.client.delete(&url);
+        if force.unwrap_or(false) {
+            req = req.query(&[("force", "true")]);
+        }
+        if let Err(e) = self.send_empty_json(req).await {
+            return Ok(Self::tool_error(e));
+        }
+        McpServer::success(&DeleteRepoResponse {
+            success: true,
+            repo_id: repo_id.to_string(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -232,6 +311,147 @@ mod tests {
         ONCE.call_once(|| {
             let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         });
+    }
+
+    #[tokio::test]
+    async fn add_repo_happy_path() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let repo_id = Uuid::new_v4();
+        mock_server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/api/repos");
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": {
+                    "id": repo_id.to_string(),
+                    "name": "acme",
+                    "display_name": "Acme",
+                    "path": "/home/alice/code/acme",
+                    "setup_script": null,
+                    "cleanup_script": null,
+                    "archive_script": null,
+                    "copy_files": null,
+                    "parallel_setup_script": false,
+                    "dev_server_script": null,
+                    "default_target_branch": null,
+                    "default_working_dir": null,
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z"
+                }
+            }));
+        });
+        let server = McpServer::new_global(&mock_server.base_url());
+        let req = AddRepoRequest {
+            path: "/home/alice/code/acme".to_string(),
+            display_name: Some("Acme".to_string()),
+        };
+        let result = server
+            .add_repo(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .expect("must succeed");
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["id"], repo_id.to_string());
+        assert_eq!(v["path"], "/home/alice/code/acme");
+    }
+
+    #[tokio::test]
+    async fn add_repo_surfaces_invalid_repo_error_kind() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        mock_server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/api/repos");
+            then.status(400).json_body(serde_json::json!({
+                "success": false,
+                "message": "not a git repository",
+                "error_kind": "invalid_repo"
+            }));
+        });
+        let server = McpServer::new_global(&mock_server.base_url());
+        let req = AddRepoRequest {
+            path: "/tmp/not-a-repo".to_string(),
+            display_name: None,
+        };
+        let result = server
+            .add_repo(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .expect("tool wraps error as CallToolResult");
+        assert!(result.is_error.unwrap_or(false));
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["error_kind"], "invalid_repo");
+    }
+
+    #[tokio::test]
+    async fn delete_repo_rejects_when_active_workspaces_without_force() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let rid = Uuid::new_v4();
+        mock_server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE)
+                .path(format!("/api/repos/{rid}"))
+                .matches(|r| !r.query_params.as_ref()
+                    .map(|p| p.iter().any(|(k, _)| k == "force"))
+                    .unwrap_or(false));
+            then.status(409).json_body(serde_json::json!({
+                "success": false,
+                "message": "Repository is used by 2 active workspace(s). Retry with ?force=true to delete anyway.",
+                "error_data": {
+                    "message": "Repository is used by 2 active workspace(s).",
+                    "workspaces": ["feature/login", "hotfix/cache"]
+                }
+            }));
+        });
+        let server = McpServer::new_global(&mock_server.base_url());
+        let req = DeleteRepoRequest {
+            repo_id: rid,
+            force: None,
+        };
+        let result = server
+            .delete_repo(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .expect("tool wraps error");
+        assert!(result.is_error.unwrap_or(false));
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let workspaces = v["error_data"]["workspaces"].as_array().unwrap();
+        assert_eq!(workspaces.len(), 2);
+        assert_eq!(workspaces[0], "feature/login");
+    }
+
+    #[tokio::test]
+    async fn delete_repo_with_force_cascades() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let rid = Uuid::new_v4();
+        let mock = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE)
+                .path(format!("/api/repos/{rid}"))
+                .query_param("force", "true");
+            then.status(200).json_body(serde_json::json!({
+                "success": true, "data": null
+            }));
+        });
+        let server = McpServer::new_global(&mock_server.base_url());
+        let req = DeleteRepoRequest {
+            repo_id: rid,
+            force: Some(true),
+        };
+        let result = server
+            .delete_repo(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .expect("must succeed");
+        assert!(!result.is_error.unwrap_or(false));
+        mock.assert_hits(1);
     }
 
     #[tokio::test]

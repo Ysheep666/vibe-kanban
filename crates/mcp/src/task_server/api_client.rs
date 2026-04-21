@@ -1,7 +1,7 @@
 //! Thin wrapper over reqwest::Client for MCP → server HTTP calls.
 //! Centralises envelope decoding for the handful of routes MCP consumes today.
 
-use db::models::{task::Task, workspace::Workspace};
+use db::models::{repo::Repo, task::Task, workspace::Workspace};
 use reqwest::Client;
 use utils::response::ApiResponse;
 use uuid::Uuid;
@@ -40,6 +40,38 @@ impl ApiClient {
         self.get_json(&format!("/api/tasks/{id}")).await
     }
 
+    pub async fn register_repo(&self, path: &str, display_name: Option<&str>) -> ApiResult<Repo> {
+        let url = format!("{}/api/repos", self.base_url);
+        let body = serde_json::json!({
+            "path": path,
+            "display_name": display_name,
+        });
+        let resp = self.client.post(url).json(&body).send().await?;
+        let envelope: ApiResponse<Repo> = resp.json().await?;
+        if !envelope.is_success() {
+            return Err(ApiClientError::Server(
+                envelope.message().unwrap_or("").to_string(),
+            ));
+        }
+        envelope.into_data().ok_or(ApiClientError::BadShape)
+    }
+
+    pub async fn delete_repo(&self, id: Uuid, force: bool) -> ApiResult<()> {
+        let url = format!("{}/api/repos/{id}", self.base_url);
+        let mut req = self.client.delete(url);
+        if force {
+            req = req.query(&[("force", "true")]);
+        }
+        let resp = req.send().await?;
+        let envelope: ApiResponse<serde_json::Value> = resp.json().await?;
+        if !envelope.is_success() {
+            return Err(ApiClientError::Server(
+                envelope.message().unwrap_or("").to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     async fn get_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> ApiResult<T> {
         let url = format!("{}{}", self.base_url, path);
         let resp = self.client.get(url).send().await?;
@@ -56,6 +88,85 @@ impl ApiClient {
 #[cfg(test)]
 mod api_client_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn register_repo_posts_payload_and_decodes_envelope() {
+        let server = httpmock::MockServer::start();
+        let rid = uuid::Uuid::new_v4();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::POST)
+                .path("/api/repos")
+                .json_body(serde_json::json!({
+                    "path": "/tmp/x",
+                    "display_name": "X"
+                }));
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": {
+                    "id": rid.to_string(),
+                    "name": "x",
+                    "display_name": "X",
+                    "path": "/tmp/x",
+                    "setup_script": null,
+                    "cleanup_script": null,
+                    "archive_script": null,
+                    "copy_files": null,
+                    "parallel_setup_script": false,
+                    "dev_server_script": null,
+                    "default_target_branch": null,
+                    "default_working_dir": null,
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z"
+                }
+            }));
+        });
+        let client = ApiClient::new(reqwest::Client::new(), server.base_url());
+        let repo = client
+            .register_repo("/tmp/x", Some("X"))
+            .await
+            .expect("must succeed");
+        assert_eq!(repo.id, rid);
+        assert_eq!(repo.name, "x");
+    }
+
+    #[tokio::test]
+    async fn delete_repo_with_force_sends_query_param() {
+        let server = httpmock::MockServer::start();
+        let rid = uuid::Uuid::new_v4();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE)
+                .path(format!("/api/repos/{rid}"))
+                .query_param("force", "true");
+            then.status(200).json_body(serde_json::json!({
+                "success": true, "data": null
+            }));
+        });
+        let client = ApiClient::new(reqwest::Client::new(), server.base_url());
+        client.delete_repo(rid, true).await.expect("must succeed");
+        mock.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn delete_repo_without_force_omits_query_param() {
+        let server = httpmock::MockServer::start();
+        let rid = uuid::Uuid::new_v4();
+        let mock = server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE)
+                .path(format!("/api/repos/{rid}"))
+                .matches(|req| {
+                    !req.query_params
+                        .as_ref()
+                        .map(|p| p.iter().any(|(k, _)| k == "force"))
+                        .unwrap_or(false)
+                });
+            then.status(200).json_body(serde_json::json!({
+                "success": true, "data": null
+            }));
+        });
+        let client = ApiClient::new(reqwest::Client::new(), server.base_url());
+        client.delete_repo(rid, false).await.expect("must succeed");
+        mock.assert_hits(1);
+    }
 
     #[tokio::test]
     async fn get_workspace_decodes_envelope() {
