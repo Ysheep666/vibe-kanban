@@ -199,14 +199,59 @@ impl McpServer {
                     .unwrap_or_else(|| "<none>".to_string())
             )),
         )
+        .with_error_kind("scope_denied")
+    }
+
+    /// Repo-level scope guard for Workspace/Orchestrator modes.
+    ///
+    /// `delete_repo` and the `update_*_script` tools mutate a `Repo` row
+    /// that can be shared across many workspaces — and `Repo` itself carries
+    /// no organisation/project/workspace foreign key (it's global in the
+    /// data model). That makes the right scope question "is this repo one
+    /// of the scoped workspace's dependencies?", which we can answer
+    /// synchronously from `context.workspace_repos` — no HTTP lookup, no
+    /// new backend endpoint needed.
+    ///
+    /// Semantics, mirroring the workspace-level guard:
+    /// - Global mode → allow (no scope in effect).
+    /// - Workspace/Orchestrator with no context → allow (graceful fallback
+    ///   — Workspace mode outside a VK worktree, Orchestrator test paths).
+    /// - Repo is in the scoped workspace's `workspace_repos` → allow.
+    /// - Anything else → `scope_denied`.
+    fn require_repo_in_scope(&self, repo_id: Uuid, verb: &str) -> Result<(), ToolError> {
+        if matches!(self.mode(), McpMode::Global) {
+            return Ok(());
+        }
+        let Some(ctx) = &self.context else {
+            return Ok(());
+        };
+        if ctx.workspace_repos.iter().any(|r| r.repo_id == repo_id) {
+            return Ok(());
+        }
+        let scoped: Vec<String> = ctx
+            .workspace_repos
+            .iter()
+            .map(|r| r.repo_id.to_string())
+            .collect();
+        Err(ToolError::new(
+            format!("Cannot {verb} repo outside the current workspace's repo set"),
+            Some(format!(
+                "requested repo_id={}, scoped workspace_id={}, scoped repos=[{}]",
+                repo_id,
+                ctx.workspace_id,
+                scoped.join(", ")
+            )),
+        )
+        .with_error_kind("scope_denied"))
     }
 }
 
-/// Async, memoised scope check for orchestrator mode.
+/// Async, memoised scope check for Workspace and Orchestrator modes.
 ///
 /// Returns `true` if `target` is allowed under the server's configured scope:
-/// - Non-orchestrator mode: always allowed.
-/// - No scoped workspace set: always allowed.
+/// - Global mode: always allowed (no scope in effect).
+/// - No scoped workspace set (Workspace graceful fallback or Orchestrator
+///   test paths): always allowed.
 /// - Same workspace as scope: allowed (no HTTP needed).
 /// - Child workspace (target's task points back to scope): allowed after HTTP lookup.
 /// - Anything else: denied.
@@ -218,9 +263,12 @@ pub(crate) async fn check_scope_allows_workspace(
     scope_cache: &mut HashMap<Uuid, bool>,
     target: Uuid,
 ) -> bool {
-    if !matches!(server.mode(), McpMode::Orchestrator) {
+    // Global has no scope at all.
+    if matches!(server.mode(), McpMode::Global) {
         return true;
     }
+    // Workspace + Orchestrator: scope check runs, but a missing scope
+    // (Workspace graceful fallback; Orchestrator test paths) is allow-all.
     let scoped = match server.scoped_workspace_id() {
         Some(x) => x,
         None => return true,
@@ -252,6 +300,7 @@ mod issue_tags;
 mod organizations;
 mod remote_issues;
 mod remote_projects;
+mod remote_tags;
 mod repos;
 mod sessions;
 mod task_attempts;
@@ -268,9 +317,28 @@ impl McpServer {
             + Self::remote_issues_tools_router()
             + Self::issue_assignees_tools_router()
             + Self::issue_tags_tools_router()
+            + Self::remote_tags_tools_router()
             + Self::issue_relationships_tools_router()
             + Self::task_attempts_tools_router()
             + Self::session_tools_router()
+    }
+
+    pub fn workspace_mode_router() -> rmcp::handler::server::tool::ToolRouter<Self> {
+        // Workspace = Global superset + task orchestration. Scope protection
+        // lives inside each mutation tool, gated by `McpMode`, so the router
+        // adds `tasks_tools_router` (create_task, create_and_start_task,
+        // list_tasks, get_task, update_task_status, delete_task) on top of
+        // the Global surface. That lets a coding agent launched inside a VK
+        // worktree spawn and drive child tasks without having to opt into
+        // the lean Orchestrator mode (which is VK-internal).
+        //
+        // The scope guards inside `tasks.rs` (see `resolve_parent_workspace_id`,
+        // `enforce_parent_scope`, `require_parent_in_scope`) already treat
+        // `McpMode::Workspace` the same as `McpMode::Orchestrator`, so the
+        // behaviour here is: auto-default `parent_workspace_id` to the
+        // scoped workspace when omitted, and reject explicit parents that
+        // fall outside the current scope or its child chain.
+        Self::global_mode_router() + Self::tasks_tools_router()
     }
 
     pub fn orchestrator_mode_router() -> rmcp::handler::server::tool::ToolRouter<Self> {
@@ -356,6 +424,95 @@ impl McpServer {
             .with_status(status.as_u16())
         })?;
         classify_response::<T>(status, body)
+    }
+
+    /// Send a request and decode a raw `MutationResponse<T>` (`{data, txid}`)
+    /// body — the shape returned by `/api/v1/*` mutation routes (those routes
+    /// do NOT wrap their success payload in `ApiResponse`; see
+    /// `mutation_response` in `crates/server/src/routes/v1.rs`). Non-2xx
+    /// responses are still parsed as `ApiResponseEnvelope` so the server's
+    /// `error_data` / `error_kind` flows through to the AI unchanged.
+    async fn send_mutation_response<T: DeserializeOwned>(
+        &self,
+        rb: reqwest::RequestBuilder,
+    ) -> Result<T, ToolError> {
+        let resp = rb.send().await.map_err(|error| {
+            ToolError::new("Failed to connect to VK API", Some(error.to_string()))
+        })?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(|error| {
+            ToolError::new(
+                format!(
+                    "Failed to read VK API response body (HTTP {})",
+                    status.as_u16()
+                ),
+                Some(error.to_string()),
+            )
+            .with_status(status.as_u16())
+        })?;
+
+        if !status.is_success() {
+            return Err(
+                match serde_json::from_str::<ApiResponseEnvelope<serde_json::Value>>(&body) {
+                    Ok(env) => envelope_to_error(env, status),
+                    Err(parse_err) => ToolError::new(
+                        format!("VK API returned HTTP {}", status.as_u16()),
+                        Some(parse_err.to_string()),
+                    )
+                    .with_status(status.as_u16())
+                    .with_body_tail(truncate_body_tail(&body)),
+                },
+            );
+        }
+
+        let envelope: api_types::MutationResponse<T> =
+            serde_json::from_str(&body).map_err(|parse_err| {
+                ToolError::new(
+                    "Failed to parse VK API mutation response",
+                    Some(parse_err.to_string()),
+                )
+                .with_status(status.as_u16())
+                .with_body_tail(truncate_body_tail(&body))
+            })?;
+        Ok(envelope.data)
+    }
+
+    /// Variant of `send_empty_json` for `/api/v1/*` DELETE routes that
+    /// return a bare `{"txid": 0}` on success (no `ApiResponse` envelope —
+    /// see `DeleteResponse` and `mutation_response` in
+    /// `crates/server/src/routes/v1.rs`). Non-2xx responses are still parsed
+    /// as `ApiResponseEnvelope` so the server's `error_data` / `error_kind`
+    /// (e.g. the tag-in-use conflict body) flows through to the AI intact.
+    async fn send_delete_raw(&self, rb: reqwest::RequestBuilder) -> Result<(), ToolError> {
+        let resp = rb.send().await.map_err(|error| {
+            ToolError::new("Failed to connect to VK API", Some(error.to_string()))
+        })?;
+        let status = resp.status();
+        let body = resp.text().await.map_err(|error| {
+            ToolError::new(
+                format!(
+                    "Failed to read VK API response body (HTTP {})",
+                    status.as_u16()
+                ),
+                Some(error.to_string()),
+            )
+            .with_status(status.as_u16())
+        })?;
+
+        if !status.is_success() {
+            return Err(
+                match serde_json::from_str::<ApiResponseEnvelope<serde_json::Value>>(&body) {
+                    Ok(env) => envelope_to_error(env, status),
+                    Err(parse_err) => ToolError::new(
+                        format!("VK API returned HTTP {}", status.as_u16()),
+                        Some(parse_err.to_string()),
+                    )
+                    .with_status(status.as_u16())
+                    .with_body_tail(truncate_body_tail(&body)),
+                },
+            );
+        }
+        Ok(())
     }
 
     async fn send_empty_json(&self, rb: reqwest::RequestBuilder) -> Result<(), ToolError> {
@@ -621,6 +778,82 @@ mod tests {
     }
 
     #[test]
+    fn global_mode_registers_new_repo_tools() {
+        let names = tool_names(McpServer::global_mode_router());
+        assert!(names.contains("add_repo"));
+        assert!(names.contains("delete_repo"));
+    }
+
+    #[test]
+    fn global_mode_registers_remote_tag_tools() {
+        let names = tool_names(McpServer::global_mode_router());
+        for expected in ["list_tags", "create_tag", "update_tag", "delete_tag"] {
+            assert!(
+                names.contains(expected),
+                "missing {expected} in global router"
+            );
+        }
+    }
+
+    #[test]
+    fn workspace_mode_exposes_global_superset() {
+        let workspace = tool_names(McpServer::workspace_mode_router());
+        let global = tool_names(McpServer::global_mode_router());
+        assert!(
+            global.is_subset(&workspace),
+            "workspace mode must include every global tool; missing: {:?}",
+            global.difference(&workspace).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn workspace_mode_exposes_task_orchestration_tools() {
+        // A coding agent launched inside a VK worktree needs the full
+        // task-orchestration surface so it can spawn and drive child tasks
+        // from the scoped workspace. These tools are scope-guarded via
+        // `resolve_parent_workspace_id` / `enforce_parent_scope` /
+        // `require_parent_in_scope` in `tasks.rs`, so exposing them in
+        // Workspace mode is safe.
+        let workspace = tool_names(McpServer::workspace_mode_router());
+        for expected in [
+            "create_task",
+            "create_and_start_task",
+            "list_tasks",
+            "get_task",
+            "update_task_status",
+            "delete_task",
+        ] {
+            assert!(
+                workspace.contains(expected),
+                "missing {expected} in workspace router"
+            );
+        }
+    }
+
+    #[test]
+    fn global_mode_does_not_expose_task_orchestration_tools() {
+        // Task orchestration is Workspace/Orchestrator-only. Global mode is
+        // for admin scripts, CI jobs, and external MCP clients that operate
+        // across workspaces — giving them `create_task` with no scoped
+        // workspace to default `parent_workspace_id` to would be a footgun
+        // (every created task would end up top-level).
+        let global = tool_names(McpServer::global_mode_router());
+        for forbidden in [
+            "create_task",
+            "create_and_start_task",
+            "list_tasks",
+            "get_task",
+            "update_task_status",
+            "delete_task",
+        ] {
+            assert!(
+                !global.contains(forbidden),
+                "{forbidden} must not be exposed in global router"
+            );
+        }
+    }
+
+    #[test]
     fn orchestrator_session_id_is_resolved_from_context() {
         install_rustls_provider();
         let session_id = Uuid::new_v4();
@@ -861,6 +1094,22 @@ mod tests {
             assert!(value.get("error_data").is_none());
             assert!(value.get("body_tail").is_none());
         }
+
+        #[test]
+        fn scope_denied_error_sets_error_kind() {
+            // The mcp-modes.mdx decision tree tells agents to branch on
+            // `error_kind = "scope_denied"`. Lock that contract in — a
+            // future refactor that drops the kind would silently break
+            // programmatic "retry with --mode global" handling.
+            let scope = uuid::Uuid::new_v4();
+            let requested = uuid::Uuid::new_v4();
+            let server = McpServer::new_workspace("http://test").with_scope_for_test(scope);
+            let err = server.scope_denied_error(requested);
+            assert_eq!(err.error_kind.as_deref(), Some("scope_denied"));
+
+            let value = McpServer::tool_error_value(err);
+            assert_eq!(value["error_kind"], json!("scope_denied"));
+        }
     }
 }
 
@@ -1018,5 +1267,47 @@ mod check_scope_tests {
 
         ws_mock.assert_hits(1);
         task_mock.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_with_none_scope_allows_all() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        // Any backend call would fail the test — assert zero hits.
+        let catch_all = mock_server.mock(|when, then| {
+            when.any_request();
+            then.status(500);
+        });
+
+        let server = McpServer::new_workspace(&mock_server.base_url());
+        // context is None by default; scope check must short-circuit to true.
+        let mut cache = HashMap::new();
+        assert!(check_scope_allows_workspace(&server, &mut cache, Uuid::new_v4()).await);
+        assert_eq!(catch_all.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_rejects_unrelated_when_scoped() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let scope = Uuid::new_v4();
+        let task_id = Uuid::new_v4();
+        let child = Uuid::new_v4();
+        let other_parent = Uuid::new_v4();
+
+        mock_server.mock(|when, then| {
+            when.path(format!("/api/workspaces/{child}"));
+            then.status(200)
+                .json_body(ws_envelope(child, Some(task_id)));
+        });
+        mock_server.mock(|when, then| {
+            when.path(format!("/api/tasks/{task_id}"));
+            then.status(200)
+                .json_body(task_envelope(task_id, Some(other_parent)));
+        });
+
+        let server = McpServer::new_workspace(&mock_server.base_url()).with_scope_for_test(scope);
+        let mut cache = HashMap::new();
+        assert!(!check_scope_allows_workspace(&server, &mut cache, child).await);
     }
 }

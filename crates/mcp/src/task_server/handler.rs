@@ -18,7 +18,7 @@ impl ServerHandler for McpServer {
         tool_names.sort();
 
         let preamble = match self.mode() {
-            McpMode::Global => {
+            McpMode::Global | McpMode::Workspace => {
                 "A Vibe Kanban MCP server for task, issue, repository, workspace, and session management."
             }
             McpMode::Orchestrator => {

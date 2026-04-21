@@ -12,8 +12,12 @@ use super::McpServer;
 struct McpRepoSummary {
     #[schemars(description = "The unique identifier of the repository")]
     id: String,
-    #[schemars(description = "The name of the repository")]
+    #[schemars(description = "The short (slug) name of the repository")]
     name: String,
+    #[schemars(description = "The human-readable display name of the repository")]
+    display_name: String,
+    #[schemars(description = "Absolute filesystem path of the repository on this machine")]
+    path: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -26,10 +30,12 @@ struct GetRepoRequest {
 struct RepoDetails {
     #[schemars(description = "The unique identifier of the repository")]
     id: String,
-    #[schemars(description = "The name of the repository")]
+    #[schemars(description = "The short (slug) name of the repository")]
     name: String,
-    #[schemars(description = "The display name of the repository")]
+    #[schemars(description = "The human-readable display name of the repository")]
     display_name: String,
+    #[schemars(description = "Absolute filesystem path of the repository on this machine")]
+    path: String,
     #[schemars(description = "The setup script that runs when initializing a workspace")]
     setup_script: Option<String>,
     #[schemars(description = "The cleanup script that runs when tearing down a workspace")]
@@ -78,6 +84,40 @@ struct ListReposResponse {
     count: usize,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct AddRepoRequest {
+    #[schemars(
+        description = "Absolute filesystem path to an existing git repository on this machine."
+    )]
+    pub path: String,
+    #[schemars(description = "Optional human-readable display name. Defaults to the folder name.")]
+    pub display_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct AddRepoResponse {
+    id: String,
+    name: String,
+    display_name: String,
+    path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub(crate) struct DeleteRepoRequest {
+    #[schemars(description = "ID of the repository to delete.")]
+    pub repo_id: Uuid,
+    #[schemars(
+        description = "If true, delete even when active workspaces reference this repo. Default: false."
+    )]
+    pub force: Option<bool>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+struct DeleteRepoResponse {
+    success: bool,
+    repo_id: String,
+}
+
 #[tool_router(router = repos_tools_router, vis = "pub")]
 impl McpServer {
     #[tool(description = "List all repositories.")]
@@ -93,6 +133,8 @@ impl McpServer {
             .map(|r| McpRepoSummary {
                 id: r.id.to_string(),
                 name: r.name,
+                display_name: r.display_name,
+                path: r.path.to_string_lossy().into_owned(),
             })
             .collect();
 
@@ -120,6 +162,7 @@ impl McpServer {
             id: repo.id.to_string(),
             name: repo.name,
             display_name: repo.display_name,
+            path: repo.path.to_string_lossy().into_owned(),
             setup_script: repo.setup_script,
             cleanup_script: repo.cleanup_script,
             dev_server_script: repo.dev_server_script,
@@ -127,7 +170,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Update a repository's setup script. The setup script runs when initializing a workspace."
+        description = "Update a repository's setup script. The setup script runs when initializing a workspace. In Workspace or Orchestrator mode the repo must belong to the scoped workspace; otherwise the tool rejects with error_kind=\"scope_denied\"."
     )]
     async fn update_setup_script(
         &self,
@@ -135,6 +178,9 @@ impl McpServer {
             UpdateSetupScriptRequest,
         >,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(error) = self.require_repo_in_scope(repo_id, "update setup_script for") {
+            return Ok(Self::tool_error(error));
+        }
         let url = self.url(&format!("/api/repos/{}", repo_id));
         let script_value = if script.is_empty() {
             None
@@ -156,7 +202,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Update a repository's cleanup script. The cleanup script runs when tearing down a workspace."
+        description = "Update a repository's cleanup script. The cleanup script runs when tearing down a workspace. In Workspace or Orchestrator mode the repo must belong to the scoped workspace; otherwise the tool rejects with error_kind=\"scope_denied\"."
     )]
     async fn update_cleanup_script(
         &self,
@@ -164,6 +210,9 @@ impl McpServer {
             UpdateCleanupScriptRequest,
         >,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(error) = self.require_repo_in_scope(repo_id, "update cleanup_script for") {
+            return Ok(Self::tool_error(error));
+        }
         let url = self.url(&format!("/api/repos/{}", repo_id));
         let script_value = if script.is_empty() {
             None
@@ -185,7 +234,7 @@ impl McpServer {
     }
 
     #[tool(
-        description = "Update a repository's dev server script. The dev server script starts the development server for the repository."
+        description = "Update a repository's dev server script. The dev server script starts the development server for the repository. In Workspace or Orchestrator mode the repo must belong to the scoped workspace; otherwise the tool rejects with error_kind=\"scope_denied\"."
     )]
     async fn update_dev_server_script(
         &self,
@@ -193,6 +242,9 @@ impl McpServer {
             UpdateDevServerScriptRequest,
         >,
     ) -> Result<CallToolResult, ErrorData> {
+        if let Err(error) = self.require_repo_in_scope(repo_id, "update dev_server_script for") {
+            return Ok(Self::tool_error(error));
+        }
         let url = self.url(&format!("/api/repos/{}", repo_id));
         let script_value = if script.is_empty() {
             None
@@ -211,5 +263,594 @@ impl McpServer {
             repo_id: repo_id.to_string(),
             field: "dev_server_script".to_string(),
         })
+    }
+
+    #[tool(
+        description = "Register an existing git repository by absolute path. Returns the new repo record. Fails with a 400-style error envelope (message='not a git repository') when the path is not a git repo; future server releases may also set error_kind='invalid_repo' on that envelope."
+    )]
+    async fn add_repo(
+        &self,
+        Parameters(AddRepoRequest { path, display_name }): Parameters<AddRepoRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let url = self.url("/api/repos");
+        let payload = serde_json::json!({
+            "path": path,
+            "display_name": display_name,
+        });
+        let repo: Repo = match self.send_json(self.client.post(&url).json(&payload)).await {
+            Ok(r) => r,
+            Err(e) => return Ok(Self::tool_error(e)),
+        };
+        McpServer::success(&AddRepoResponse {
+            id: repo.id.to_string(),
+            name: repo.name,
+            display_name: repo.display_name,
+            path: repo.path.to_string_lossy().into_owned(),
+        })
+    }
+
+    #[tool(
+        description = "Delete a repository. When active workspaces reference the repo, rejects with a 409 envelope whose error_data = {message, workspaces: string[]} lists the blocking workspace branches; pass force=true to delete anyway. In Workspace or Orchestrator mode the repo must be part of the scoped workspace's repo set — otherwise the tool rejects with error_kind=\"scope_denied\" and the cross-workspace delete must be retried under --mode global. Future server releases may also set error_kind on the 409 envelope."
+    )]
+    async fn delete_repo(
+        &self,
+        Parameters(DeleteRepoRequest { repo_id, force }): Parameters<DeleteRepoRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        if let Err(error) = self.require_repo_in_scope(repo_id, "delete") {
+            return Ok(Self::tool_error(error));
+        }
+        let url = self.url(&format!("/api/repos/{}", repo_id));
+        let mut req = self.client.delete(&url);
+        if force.unwrap_or(false) {
+            req = req.query(&[("force", "true")]);
+        }
+        if let Err(e) = self.send_empty_json(req).await {
+            return Ok(Self::tool_error(e));
+        }
+        McpServer::success(&DeleteRepoResponse {
+            success: true,
+            repo_id: repo_id.to_string(),
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use httpmock::MockServer;
+
+    use super::*;
+    use crate::task_server::McpServer;
+
+    fn install_rustls() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+    }
+
+    #[tokio::test]
+    async fn add_repo_happy_path() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let repo_id = Uuid::new_v4();
+        mock_server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/api/repos");
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": {
+                    "id": repo_id.to_string(),
+                    "name": "acme",
+                    "display_name": "Acme",
+                    "path": "/home/alice/code/acme",
+                    "setup_script": null,
+                    "cleanup_script": null,
+                    "archive_script": null,
+                    "copy_files": null,
+                    "parallel_setup_script": false,
+                    "dev_server_script": null,
+                    "default_target_branch": null,
+                    "default_working_dir": null,
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z"
+                }
+            }));
+        });
+        let server = McpServer::new_global(&mock_server.base_url());
+        let req = AddRepoRequest {
+            path: "/home/alice/code/acme".to_string(),
+            display_name: Some("Acme".to_string()),
+        };
+        let result = server
+            .add_repo(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .expect("must succeed");
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["id"], repo_id.to_string());
+        assert_eq!(v["path"], "/home/alice/code/acme");
+    }
+
+    #[tokio::test]
+    async fn add_repo_surfaces_invalid_repo_error_kind() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        mock_server.mock(|when, then| {
+            when.method(httpmock::Method::POST).path("/api/repos");
+            then.status(400).json_body(serde_json::json!({
+                "success": false,
+                "message": "not a git repository",
+                "error_kind": "invalid_repo"
+            }));
+        });
+        let server = McpServer::new_global(&mock_server.base_url());
+        let req = AddRepoRequest {
+            path: "/tmp/not-a-repo".to_string(),
+            display_name: None,
+        };
+        let result = server
+            .add_repo(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .expect("tool wraps error as CallToolResult");
+        assert!(result.is_error.unwrap_or(false));
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["error_kind"], "invalid_repo");
+    }
+
+    #[tokio::test]
+    async fn delete_repo_rejects_when_active_workspaces_without_force() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let rid = Uuid::new_v4();
+        mock_server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE)
+                .path(format!("/api/repos/{rid}"))
+                .matches(|r| !r.query_params.as_ref()
+                    .map(|p| p.iter().any(|(k, _)| k == "force"))
+                    .unwrap_or(false));
+            then.status(409).json_body(serde_json::json!({
+                "success": false,
+                "message": "Repository is used by 2 active workspace(s). Retry with ?force=true to delete anyway.",
+                "error_data": {
+                    "message": "Repository is used by 2 active workspace(s).",
+                    "workspaces": ["feature/login", "hotfix/cache"]
+                }
+            }));
+        });
+        let server = McpServer::new_global(&mock_server.base_url());
+        let req = DeleteRepoRequest {
+            repo_id: rid,
+            force: None,
+        };
+        let result = server
+            .delete_repo(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .expect("tool wraps error");
+        assert!(result.is_error.unwrap_or(false));
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let workspaces = v["error_data"]["workspaces"].as_array().unwrap();
+        assert_eq!(workspaces.len(), 2);
+        assert_eq!(workspaces[0], "feature/login");
+    }
+
+    #[tokio::test]
+    async fn delete_repo_with_force_cascades() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let rid = Uuid::new_v4();
+        let mock = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE)
+                .path(format!("/api/repos/{rid}"))
+                .query_param("force", "true");
+            then.status(200).json_body(serde_json::json!({
+                "success": true, "data": null
+            }));
+        });
+        let server = McpServer::new_global(&mock_server.base_url());
+        let req = DeleteRepoRequest {
+            repo_id: rid,
+            force: Some(true),
+        };
+        let result = server
+            .delete_repo(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .expect("must succeed");
+        assert!(!result.is_error.unwrap_or(false));
+        mock.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn list_repos_returns_path_and_display_name() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let repo_id = Uuid::new_v4();
+        mock_server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/api/repos");
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": [{
+                    "id": repo_id.to_string(),
+                    "name": "vibe-kanban",
+                    "display_name": "Vibe Kanban",
+                    "path": "/home/alice/code/vibe-kanban",
+                    "setup_script": null,
+                    "cleanup_script": null,
+                    "archive_script": null,
+                    "copy_files": null,
+                    "parallel_setup_script": false,
+                    "dev_server_script": null,
+                    "default_target_branch": null,
+                    "default_working_dir": null,
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z"
+                }]
+            }));
+        });
+
+        let server = McpServer::new_global(&mock_server.base_url());
+        let result = server.list_repos().await.expect("list_repos must succeed");
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        };
+        // Parse and assert.
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let first = &value["repos"][0];
+        assert_eq!(first["id"], repo_id.to_string());
+        assert_eq!(first["name"], "vibe-kanban");
+        assert_eq!(first["display_name"], "Vibe Kanban");
+        assert_eq!(first["path"], "/home/alice/code/vibe-kanban");
+    }
+
+    #[tokio::test]
+    async fn get_repo_returns_path() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let repo_id = Uuid::new_v4();
+        mock_server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path(format!("/api/repos/{repo_id}"));
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": {
+                    "id": repo_id.to_string(),
+                    "name": "vibe-kanban",
+                    "display_name": "Vibe Kanban",
+                    "path": "/home/alice/code/vibe-kanban",
+                    "setup_script": null,
+                    "cleanup_script": null,
+                    "archive_script": null,
+                    "copy_files": null,
+                    "parallel_setup_script": false,
+                    "dev_server_script": null,
+                    "default_target_branch": null,
+                    "default_working_dir": null,
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z"
+                }
+            }));
+        });
+        let server = McpServer::new_global(&mock_server.base_url());
+        let req = GetRepoRequest { repo_id };
+        let result = server
+            .get_repo(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .expect("get_repo must succeed");
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        };
+        let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["id"], repo_id.to_string());
+        assert_eq!(v["name"], "vibe-kanban");
+        assert_eq!(v["display_name"], "Vibe Kanban");
+        assert_eq!(v["path"], "/home/alice/code/vibe-kanban");
+    }
+
+    // ----------------------------------------------------------------------
+    // Repo-level scope guard (C2 — Workspace-mode protection for
+    // `delete_repo` + `update_*_script`).
+    //
+    // `Repo` has no project/workspace foreign key — it's global in the data
+    // model — so the scope check asks "is this repo in the scoped
+    // workspace's repo set?". That set is already in `McpContext`, so the
+    // guard is purely in-memory: a catch-all mock with `status(500)` on the
+    // mutation endpoint verifies the tool short-circuits before touching
+    // HTTP.
+    // ----------------------------------------------------------------------
+
+    /// Decode a `CallToolResult` error body as JSON so `error_kind` can be
+    /// asserted structurally. Mirrors the helper in `remote_tags.rs`.
+    fn error_json(result: &rmcp::model::CallToolResult) -> serde_json::Value {
+        assert!(
+            result.is_error.unwrap_or(false),
+            "expected error: {result:?}"
+        );
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text"),
+        };
+        serde_json::from_str(&text).expect("tool error body must be JSON")
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_delete_repo_rejects_repo_outside_scope() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        // Any DELETE would be a regression — the guard must short-circuit.
+        let backend_guard = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE);
+            then.status(500);
+        });
+
+        let scope_ws = Uuid::new_v4();
+        let scoped_repo = Uuid::new_v4();
+        let unrelated_repo = Uuid::new_v4();
+
+        let server = McpServer::new_workspace(&mock_server.base_url())
+            .with_scope_and_repos_for_test(scope_ws, vec![scoped_repo]);
+        let req = DeleteRepoRequest {
+            repo_id: unrelated_repo,
+            force: None,
+        };
+        let result = server
+            .delete_repo(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .unwrap();
+
+        let body = error_json(&result);
+        assert_eq!(
+            body.get("error_kind").and_then(|v| v.as_str()),
+            Some("scope_denied"),
+            "expected scope_denied: {body}"
+        );
+        assert_eq!(
+            backend_guard.hits(),
+            0,
+            "DELETE /api/repos/{{id}} must not fire when repo is out of scope",
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_delete_repo_allows_repo_in_scope() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let scope_ws = Uuid::new_v4();
+        let scoped_repo = Uuid::new_v4();
+
+        let delete_mock = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE)
+                .path(format!("/api/repos/{scoped_repo}"));
+            then.status(200).json_body(serde_json::json!({
+                "success": true, "data": null
+            }));
+        });
+
+        let server = McpServer::new_workspace(&mock_server.base_url())
+            .with_scope_and_repos_for_test(scope_ws, vec![scoped_repo]);
+        let req = DeleteRepoRequest {
+            repo_id: scoped_repo,
+            force: None,
+        };
+        let result = server
+            .delete_repo(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error.unwrap_or(false),
+            "in-scope delete should succeed: {result:?}"
+        );
+        delete_mock.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_without_context_allows_delete_repo() {
+        // Graceful fallback: Workspace mode launched from a CWD that doesn't
+        // match a VK worktree has no context → scope check is allow-all,
+        // matching the workspace-level guard semantics documented in
+        // `mcp-modes.mdx`.
+        install_rustls();
+        let mock_server = MockServer::start();
+        let rid = Uuid::new_v4();
+
+        let delete_mock = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE)
+                .path(format!("/api/repos/{rid}"));
+            then.status(200).json_body(serde_json::json!({
+                "success": true, "data": null
+            }));
+        });
+
+        let server = McpServer::new_workspace(&mock_server.base_url());
+        let req = DeleteRepoRequest {
+            repo_id: rid,
+            force: None,
+        };
+        let result = server
+            .delete_repo(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        delete_mock.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn global_mode_does_not_apply_repo_scope_guard() {
+        // Sanity: Global mode has no scope — even the mere presence of the
+        // scope helper in `delete_repo` must never block a Global-mode caller.
+        install_rustls();
+        let mock_server = MockServer::start();
+        let rid = Uuid::new_v4();
+
+        let delete_mock = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::DELETE)
+                .path(format!("/api/repos/{rid}"));
+            then.status(200).json_body(serde_json::json!({
+                "success": true, "data": null
+            }));
+        });
+
+        let server = McpServer::new_global(&mock_server.base_url());
+        let req = DeleteRepoRequest {
+            repo_id: rid,
+            force: None,
+        };
+        let result = server
+            .delete_repo(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        delete_mock.assert_hits(1);
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_update_setup_script_rejects_repo_outside_scope() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let backend_guard = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::PUT);
+            then.status(500);
+        });
+
+        let scope_ws = Uuid::new_v4();
+        let scoped_repo = Uuid::new_v4();
+        let unrelated_repo = Uuid::new_v4();
+
+        let server = McpServer::new_workspace(&mock_server.base_url())
+            .with_scope_and_repos_for_test(scope_ws, vec![scoped_repo]);
+        let req = UpdateSetupScriptRequest {
+            repo_id: unrelated_repo,
+            script: "echo hi".to_string(),
+        };
+        let result = server
+            .update_setup_script(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .unwrap();
+
+        let body = error_json(&result);
+        assert_eq!(
+            body.get("error_kind").and_then(|v| v.as_str()),
+            Some("scope_denied"),
+        );
+        assert_eq!(backend_guard.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_update_cleanup_script_rejects_repo_outside_scope() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let backend_guard = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::PUT);
+            then.status(500);
+        });
+
+        let scope_ws = Uuid::new_v4();
+        let scoped_repo = Uuid::new_v4();
+        let unrelated_repo = Uuid::new_v4();
+
+        let server = McpServer::new_workspace(&mock_server.base_url())
+            .with_scope_and_repos_for_test(scope_ws, vec![scoped_repo]);
+        let req = UpdateCleanupScriptRequest {
+            repo_id: unrelated_repo,
+            script: "echo bye".to_string(),
+        };
+        let result = server
+            .update_cleanup_script(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .unwrap();
+
+        let body = error_json(&result);
+        assert_eq!(
+            body.get("error_kind").and_then(|v| v.as_str()),
+            Some("scope_denied"),
+        );
+        assert_eq!(backend_guard.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_update_dev_server_script_rejects_repo_outside_scope() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let backend_guard = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::PUT);
+            then.status(500);
+        });
+
+        let scope_ws = Uuid::new_v4();
+        let scoped_repo = Uuid::new_v4();
+        let unrelated_repo = Uuid::new_v4();
+
+        let server = McpServer::new_workspace(&mock_server.base_url())
+            .with_scope_and_repos_for_test(scope_ws, vec![scoped_repo]);
+        let req = UpdateDevServerScriptRequest {
+            repo_id: unrelated_repo,
+            script: "npm run dev".to_string(),
+        };
+        let result = server
+            .update_dev_server_script(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .unwrap();
+
+        let body = error_json(&result);
+        assert_eq!(
+            body.get("error_kind").and_then(|v| v.as_str()),
+            Some("scope_denied"),
+        );
+        assert_eq!(backend_guard.hits(), 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_mode_update_setup_script_allows_repo_in_scope() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let scope_ws = Uuid::new_v4();
+        let scoped_repo = Uuid::new_v4();
+
+        let update_mock = mock_server.mock(|when, then| {
+            when.method(httpmock::Method::PUT)
+                .path(format!("/api/repos/{scoped_repo}"));
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": {
+                    "id": scoped_repo.to_string(),
+                    "name": "ok",
+                    "display_name": "Ok",
+                    "path": "/tmp/ok",
+                    "setup_script": "echo hi",
+                    "cleanup_script": null,
+                    "archive_script": null,
+                    "copy_files": null,
+                    "parallel_setup_script": false,
+                    "dev_server_script": null,
+                    "default_target_branch": null,
+                    "default_working_dir": null,
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z"
+                }
+            }));
+        });
+
+        let server = McpServer::new_workspace(&mock_server.base_url())
+            .with_scope_and_repos_for_test(scope_ws, vec![scoped_repo]);
+        let req = UpdateSetupScriptRequest {
+            repo_id: scoped_repo,
+            script: "echo hi".to_string(),
+        };
+        let result = server
+            .update_setup_script(rmcp::handler::server::wrapper::Parameters(req))
+            .await
+            .unwrap();
+        assert!(!result.is_error.unwrap_or(false));
+        update_mock.assert_hits(1);
     }
 }

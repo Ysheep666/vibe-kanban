@@ -334,6 +334,12 @@ pub async fn get_pr_info(
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub struct DeleteRepoQuery {
+    #[serde(default)]
+    pub force: bool,
+}
+
 #[derive(Debug, Serialize, TS)]
 pub struct DeleteRepoConflict {
     pub message: String,
@@ -343,6 +349,7 @@ pub struct DeleteRepoConflict {
 pub async fn delete_repo(
     State(deployment): State<DeploymentImpl>,
     Path(repo_id): Path<Uuid>,
+    Query(query): Query<DeleteRepoQuery>,
 ) -> Result<
     (
         StatusCode,
@@ -350,15 +357,20 @@ pub async fn delete_repo(
     ),
     ApiError,
 > {
-    let active = Repo::active_workspace_names(&deployment.db().pool, repo_id).await?;
-    if !active.is_empty() {
-        return Ok((
-            StatusCode::CONFLICT,
-            ResponseJson(ApiResponse::error_with_data(DeleteRepoConflict {
-                message: format!("Repository is used by {} active workspace(s)", active.len()),
-                workspaces: active,
-            })),
-        ));
+    if !query.force {
+        let active = Repo::active_workspace_names(&deployment.db().pool, repo_id).await?;
+        if !active.is_empty() {
+            return Ok((
+                StatusCode::CONFLICT,
+                ResponseJson(ApiResponse::error_with_data(DeleteRepoConflict {
+                    message: format!(
+                        "Repository is used by {} active workspace(s). Retry with ?force=true to delete anyway.",
+                        active.len()
+                    ),
+                    workspaces: active,
+                })),
+            ));
+        }
     }
 
     Repo::delete(&deployment.db().pool, repo_id).await?;
@@ -381,4 +393,27 @@ pub fn router() -> Router<DeploymentImpl> {
         .route("/repos/pr-info", get(get_pr_info))
         .route("/repos/{repo_id}/search", get(search_repo))
         .route("/repos/{repo_id}/open-editor", post(open_repo_in_editor))
+}
+
+#[cfg(test)]
+mod delete_repo_query_tests {
+    use super::*;
+
+    #[test]
+    fn force_query_defaults_false_when_missing() {
+        let q: DeleteRepoQuery = serde_urlencoded::from_str("").unwrap();
+        assert!(!q.force);
+    }
+
+    #[test]
+    fn force_query_parses_true() {
+        let q: DeleteRepoQuery = serde_urlencoded::from_str("force=true").unwrap();
+        assert!(q.force);
+    }
+
+    #[test]
+    fn force_query_parses_false_explicit() {
+        let q: DeleteRepoQuery = serde_urlencoded::from_str("force=false").unwrap();
+        assert!(!q.force);
+    }
 }

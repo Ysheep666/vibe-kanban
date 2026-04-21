@@ -114,6 +114,7 @@
           "integrations/azure-repos-integration",
           "integrations/vscode-extension",
           "integrations/mcp-server-configuration",
+          "integrations/mcp-modes",
           "integrations/vibe-kanban-mcp-server"
         ]
       },

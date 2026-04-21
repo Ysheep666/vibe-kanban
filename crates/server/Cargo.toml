@@ -72,6 +72,7 @@ dotenv = "0.15"
 
 [dev-dependencies]
 tempfile = "3"
+serde_urlencoded = "0.7"
 
 [features]
 default = []
