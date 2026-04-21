@@ -12,8 +12,12 @@ use super::McpServer;
 struct McpRepoSummary {
     #[schemars(description = "The unique identifier of the repository")]
     id: String,
-    #[schemars(description = "The name of the repository")]
+    #[schemars(description = "The short (slug) name of the repository")]
     name: String,
+    #[schemars(description = "The human-readable display name of the repository")]
+    display_name: String,
+    #[schemars(description = "Absolute filesystem path of the repository on this machine")]
+    path: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -93,6 +97,8 @@ impl McpServer {
             .map(|r| McpRepoSummary {
                 id: r.id.to_string(),
                 name: r.name,
+                display_name: r.display_name,
+                path: r.path.to_string_lossy().into_owned(),
             })
             .collect();
 
@@ -211,5 +217,63 @@ impl McpServer {
             repo_id: repo_id.to_string(),
             field: "dev_server_script".to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use httpmock::MockServer;
+
+    use super::*;
+    use crate::task_server::McpServer;
+
+    fn install_rustls() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        });
+    }
+
+    #[tokio::test]
+    async fn list_repos_returns_path_and_display_name() {
+        install_rustls();
+        let mock_server = MockServer::start();
+        let repo_id = Uuid::new_v4();
+        mock_server.mock(|when, then| {
+            when.method(httpmock::Method::GET).path("/api/repos");
+            then.status(200).json_body(serde_json::json!({
+                "success": true,
+                "data": [{
+                    "id": repo_id.to_string(),
+                    "name": "vibe-kanban",
+                    "display_name": "Vibe Kanban",
+                    "path": "/home/alice/code/vibe-kanban",
+                    "setup_script": null,
+                    "cleanup_script": null,
+                    "archive_script": null,
+                    "copy_files": null,
+                    "parallel_setup_script": false,
+                    "dev_server_script": null,
+                    "default_target_branch": null,
+                    "default_working_dir": null,
+                    "created_at": "2025-01-01T00:00:00Z",
+                    "updated_at": "2025-01-01T00:00:00Z"
+                }]
+            }));
+        });
+
+        let server = McpServer::new_global(&mock_server.base_url());
+        let result = server.list_repos().await.expect("list_repos must succeed");
+        let text = match &result.content[0].raw {
+            rmcp::model::RawContent::Text(t) => t.text.clone(),
+            _ => panic!("expected text content"),
+        };
+        // Parse and assert.
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let first = &value["repos"][0];
+        assert_eq!(first["id"], repo_id.to_string());
+        assert_eq!(first["name"], "vibe-kanban");
+        assert_eq!(first["display_name"], "Vibe Kanban");
+        assert_eq!(first["path"], "/home/alice/code/vibe-kanban");
     }
 }
